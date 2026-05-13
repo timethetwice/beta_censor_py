@@ -1,205 +1,276 @@
 from ultralytics import YOLO
 import cv2
-import numpy as np
-from threading import Thread
-from queue import Queue, Empty
+import os
+import tkinter as tk
+from tkinter import ttk
+
+class DetectionControlPanel:
+    def __init__(self, nudenet_labels, sensitive_labels):
+        """
+        GUI 控制面板：选择要绘制哪些检测框
+
+        Args:
+            nudenet_labels: 所有标签列表
+            sensitive_labels: 敏感标签列表
+        """
+        self.nudenet_labels = nudenet_labels
+        self.sensitive_labels = sensitive_labels
+
+        # 默认全部显示
+        self._show_sensitive = tk.BooleanVar(value=True)
+        self._show_non_sensitive = tk.BooleanVar(value=True)
+        self._label_vars = {}
+
+        self.root = tk.Tk()
+        self.root.title("检测框显示控制")
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._running = True
+
+        self._build_ui()
+
+    def _build_ui(self):
+        main_frame = ttk.Frame(self.root, padding=10)
+        main_frame.pack(fill=tk.BOTH, expand=True)
+
+        # 快捷开关
+        quick_frame = ttk.LabelFrame(main_frame, text="快捷控制", padding=5)
+        quick_frame.pack(fill=tk.X, pady=(0, 10))
+
+        ttk.Checkbutton(quick_frame, text="显示所有敏感框",
+                        variable=self._show_sensitive).pack(anchor='w')
+        ttk.Checkbutton(quick_frame, text="显示所有普通框",
+                        variable=self._show_non_sensitive).pack(anchor='w')
+
+        ttk.Separator(main_frame).pack(fill=tk.X, pady=5)
+
+        # 逐类别控制
+        detail_frame = ttk.LabelFrame(main_frame, text="逐类别控制", padding=5)
+        detail_frame.pack(fill=tk.BOTH, expand=True)
+
+        # 画布+滚动条
+        canvas = tk.Canvas(detail_frame, height=400)
+        scrollbar = ttk.Scrollbar(detail_frame, orient=tk.VERTICAL, command=canvas.yview)
+        scrollable_frame = ttk.Frame(canvas)
+
+        scrollable_frame.bind(
+            "<Configure>",
+            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
+        )
+        canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+
+        # 为每个标签创建复选框
+        self._label_vars = {}
+        for label in self.nudenet_labels:
+            var = tk.BooleanVar(value=True)
+            self._label_vars[label] = var
+            is_sensitive = label in self.sensitive_labels
+            display_text = f"{'⚠️' if is_sensitive else '✓'} {label}"
+            cb = ttk.Checkbutton(scrollable_frame, text=display_text, variable=var)
+            cb.pack(anchor='w', pady=1)
+
+    def should_draw(self, class_name):
+        """
+        判断某个检测框是否应该绘制
+        Args:
+            class_name: 类别名称（如 'FEMALE_BREAST_EXPOSED'）
+        Returns:
+            bool: 是否绘制
+        """
+        if not self._running:
+            return False
+
+        is_sensitive = class_name in self.sensitive_labels
+
+        # 快捷开关检查
+        if is_sensitive and not self._show_sensitive.get():
+            return False
+        if not is_sensitive and not self._show_non_sensitive.get():
+            return False
+
+        # 逐类别检查
+        if class_name in self._label_vars:
+            return self._label_vars[class_name].get()
+        return True  # 未知类别默认显示
+
+    def update(self):
+        """更新 tkinter 事件循环（非阻塞）"""
+        if self._running:
+            self.root.update()
+        return self._running
+
+    def _on_close(self):
+        self._running = False
+        self.root.destroy()
+
+    def close(self):
+        self._running = False
+        self.root.destroy()
+
+
+
+
+
+
 
 class RealtimeCascadeDetector:
     def __init__(self, fast_model='models/yolo26n.engine', precise_model='models/nudenet_640m.engine'):
-        """
-        级联检测器
-        fast_model: 快速检测模型（检测人）
-        precise_model: NudeNet 敏感内容检测模型
-        """
         self.fast_model = YOLO(fast_model, task='detect')
-        # NudeNet 模型也需要指定 task='detect'
         self.precise_model = YOLO(precise_model, task='detect')
-        self.frame_queue = Queue(maxsize=10)
-        self.result_queue = Queue(maxsize=10)
-        self.running = False
-        
+
         # NudeNet 标签映射
         self.nudenet_labels = [
-            "FEMALE_GENITALIA_COVERED",
-            "FACE_FEMALE",
-            "BUTTOCKS_EXPOSED",
-            "FEMALE_BREAST_EXPOSED",
-            "FEMALE_GENITALIA_EXPOSED",
-            "MALE_BREAST_EXPOSED",
-            "ANUS_EXPOSED",
-            "FEET_EXPOSED",
-            "BELLY_COVERED",
-            "FEET_COVERED",
-            "ARMPITS_COVERED",
-            "ARMPITS_EXPOSED",
-            "FACE_MALE",
-            "BELLY_EXPOSED",
-            "MALE_GENITALIA_EXPOSED",
-            "ANUS_COVERED",
-            "FEMALE_BREAST_COVERED",
-            "BUTTOCKS_COVERED",
+            "FEMALE_GENITALIA_COVERED", "FACE_FEMALE", "BUTTOCKS_EXPOSED",
+            "FEMALE_BREAST_EXPOSED", "FEMALE_GENITALIA_EXPOSED",
+            "MALE_BREAST_EXPOSED", "ANUS_EXPOSED", "FEET_EXPOSED",
+            "BELLY_COVERED", "FEET_COVERED", "ARMPITS_COVERED",
+            "ARMPITS_EXPOSED", "FACE_MALE", "BELLY_EXPOSED",
+            "MALE_GENITALIA_EXPOSED", "ANUS_COVERED",
+            "FEMALE_BREAST_COVERED", "BUTTOCKS_COVERED",
         ]
-        
-        # 敏感类别列表（可根据需要调整）
         self.sensitive_labels = [
-            "BUTTOCKS_EXPOSED",
-            "FEMALE_BREAST_EXPOSED",
-            "FEMALE_GENITALIA_EXPOSED",
-            "MALE_BREAST_EXPOSED",
-            "ANUS_EXPOSED",
-            "MALE_GENITALIA_EXPOSED",
+            "BUTTOCKS_EXPOSED", "FEMALE_BREAST_EXPOSED",
+            "FEMALE_GENITALIA_EXPOSED", "MALE_BREAST_EXPOSED",
+            "ANUS_EXPOSED", "MALE_GENITALIA_EXPOSED",
         ]
-    
+        # 新增：控制面板（延迟初始化，避免影响模型加载）
+        self.control_panel = None
+
     def get_label_name(self, class_id):
-        """获取标签名称"""
         if 0 <= class_id < len(self.nudenet_labels):
             return self.nudenet_labels[class_id]
         return f"UNKNOWN_{class_id}"
-    
-    def frame_processor(self):
-        """帧处理线程"""
-        while self.running:
-            try:
-                frame_data = self.frame_queue.get(timeout=0.1)
-                frame, frame_id = frame_data
-                
-                # 第一阶段：检测人
-                results = self.fast_model(frame, conf=0.3, classes=[0])
-                
-                candidates = []
-                height, width = frame.shape[:2]
-                
-                for r in results[0].boxes:
-                    x1, y1, x2, y2 = map(int, r.xyxy[0].tolist())
-                    # 扩大边界，确保人体完整
-                    padding = 50
-                    x1 = max(0, x1 - padding)
-                    y1 = max(0, y1 - padding)
-                    x2 = min(width, x2 + padding)
-                    y2 = min(height, y2 + padding)
-                    candidates.append((x1, y1, x2, y2))
-                
-                # 第二阶段：NudeNet 敏感内容检测
-                final_results = []
-                for idx, (x1, y1, x2, y2) in enumerate(candidates):  # 添加 idx
-                    roi = frame[y1:y2, x1:x2]
-                    if roi.size == 0:
-                        continue
-                    
-                    # 每30帧保存一次 ROI（调试用）
-                    if frame_id % 30 == 0:
-                        cv2.imwrite(f'./debug_roi/debug_roi_{frame_id}_{idx}.jpg', roi)
-                        # print(f"保存 ROI: debug_roi_{frame_id}_{idx}.jpg, 尺寸 {roi.shape[1]}x{roi.shape[0]}")
-                    
-                    # 使用 NudeNet 模型检测
-                    precise_results = self.precise_model(roi, conf=0.3)
-                    
-                    for pr in precise_results[0].boxes:
-                        rx1, ry1, rx2, ry2 = map(int, pr.xyxy[0].tolist())
-                        conf = float(pr.conf[0])
-                        cls = int(pr.cls[0])
-                        label_name = self.get_label_name(cls)
-                        
-                        final_results.append({
-                            'bbox': (x1 + rx1, y1 + ry1, x1 + rx2, y1 + ry2),
-                            'class': cls,
-                            'class_name': label_name,
-                            'confidence': conf,
-                            'is_sensitive': label_name in self.sensitive_labels
-                        })
-                
-                self.result_queue.put((frame_id, final_results))
-                
-            except Empty:
-                continue
-            except Exception as e:
-                print(f"处理错误: {e}")
-    
+
     def draw_results(self, frame, detections):
-        """绘制检测框（不同颜色表示不同敏感度）"""
         for det in detections:
+            # 检查是否应该绘制
+            if self.control_panel is not None and not self.control_panel.should_draw(det['class_name']):
+                continue
             x1, y1, x2, y2 = det['bbox']
-            
-            # 根据敏感度选择颜色
-            if det['is_sensitive']:
-                color = (0, 0, 255)  # 红色 - 敏感内容
-                thickness = 3
-            else:
-                color = (0, 255, 255)  # 黄色 - 普通内容
-                thickness = 2
-            
+            color = (0, 0, 255) if det['is_sensitive'] else (0, 255, 255)
+            thickness = 3 if det['is_sensitive'] else 2
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
-            
-            # 添加标签
+
             label = f"{det['class_name']}: {det['confidence']:.2f}"
             if det['is_sensitive']:
                 label = "⚠️ " + label
-            
-            # 计算文字位置
+
             (w, h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
             cv2.rectangle(frame, (x1, y1 - h - 5), (x1 + w, y1), color, -1)
             cv2.putText(frame, label, (x1, y1 - 5),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
-        
         return frame
-    
-    def start(self, video_source=0, output_path="output.mp4"):
-        """启动级联检测"""
-        self.running = True
-        
-        # 启动处理线程
-        processor_thread = Thread(target=self.frame_processor)
-        processor_thread.start()
-        
-        # 打开视频源
+
+    def run(self, video_source=0, output_path="output.mp4"):
         cap = cv2.VideoCapture(video_source)
         if not cap.isOpened():
-            print(f"错误：无法打开视频源 {video_source}")
-            self.running = False
+            print(f"无法打开视频源: {video_source}")
             return
-        
-        # 获取视频参数
+
         fps = cap.get(cv2.CAP_PROP_FPS)
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
         out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
-        
+
+        os.makedirs('./debug_roi', exist_ok=True)
         frame_id = 0
-        
-        while self.running:
+        # 新增：初始化控制面板
+        self.control_panel = DetectionControlPanel(
+            nudenet_labels=self.nudenet_labels,
+            sensitive_labels=self.sensitive_labels
+        )
+
+        while True:
             ret, frame = cap.read()
             if not ret:
-                print("视频播放完毕")
                 break
-            
-            # 存入队列
-            try:
-                self.frame_queue.put((frame, frame_id), timeout=1)
-            except:
-                pass
-            
-            # 获取检测结果
-            try:
-                _, results = self.result_queue.get(timeout=0.05)
-                frame = self.draw_results(frame, results)
-            except Empty:
-                pass
-            
-            # 写入和显示
-            out.write(frame)
-            cv2.imshow('NudeNet Detection', frame)
+
+            # ----------------- 第一阶段：检测人 -----------------
+            results_fast = self.fast_model(frame, conf=0.3, classes=[0])
+            candidates = []
+            h, w = frame.shape[:2]
+            for box in results_fast[0].boxes:
+                x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+                pad = 50
+                x1 = max(0, x1 - pad)
+                y1 = max(0, y1 - pad)
+                x2 = min(w, x2 + pad)
+                y2 = min(h, y2 + pad)
+                candidates.append((x1, y1, x2, y2))
+
+            # ----------------- 第二阶段：NudeNet 检测 -----------------
+            final_detections = []
+            for idx, (x1, y1, x2, y2) in enumerate(candidates):
+                roi = frame[y1:y2, x1:x2]
+                if roi.size == 0:
+                    continue
+
+                # 关键：不手动 resize，直接送入 ROI，且指定 imgsz 与引擎输出一致
+                precise_results = self.precise_model(
+                    roi,
+                    conf=0.3,
+                    imgsz=(640, 384)   # 高640，宽384
+                )
+
+                for pr in precise_results[0].boxes:
+                    rx1, ry1, rx2, ry2 = map(int, pr.xyxy[0].tolist())
+                    conf = float(pr.conf[0])
+                    cls = int(pr.cls[0])
+                    label_name = self.get_label_name(cls)
+
+                    final_detections.append({
+                        'bbox': (x1 + rx1, y1 + ry1, x1 + rx2, y1 + ry2),
+                        'class': cls,
+                        'class_name': label_name,
+                        'confidence': conf,
+                        'is_sensitive': label_name in self.sensitive_labels
+                    })
+
+                # 调试保存（带检测框的 ROI）
+                if frame_id % 30 == 0:
+                    roi_annotated = roi.copy()
+                    # 只画属于当前 roi 的检测框
+                    for det in final_detections:
+                        # 检测框坐标是全局的，需要转换回 roi 内坐标
+                        gx1, gy1, gx2, gy2 = det['bbox']
+                        # 检查这个框是否落在当前 roi 区域内（简单包含判断）
+                        if gx1 >= x1 and gy1 >= y1 and gx2 <= x2 and gy2 <= y2:
+                            rx1 = gx1 - x1
+                            ry1 = gy1 - y1
+                            rx2 = gx2 - x1
+                            ry2 = gy2 - y1
+                            color = (0, 0, 255) if det['is_sensitive'] else (0, 255, 255)
+                            cv2.rectangle(roi_annotated, (rx1, ry1), (rx2, ry2), color, 2)
+                            label = f"{det['class_name']}: {det['confidence']:.2f}"
+                            cv2.putText(roi_annotated, label, (rx1, ry1-5),
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+                    cv2.imwrite(f'./debug_roi/debug_roi_{frame_id}_{idx}.jpg', roi_annotated)
+
+        # ----------------- 绘制并保存 -----------------
+            annotated = self.draw_results(frame, final_detections)
+            out.write(annotated)
+            cv2.imshow('Cascade Detection', annotated)
             frame_id += 1
-            
+
+            # 新增：更新控制面板（替代原有简单的 waitKey）
+            if not self.control_panel.update():
+                break  # GUI 关闭时退出循环
+
+            # 仍然保留键盘退出方式
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
-        
-        # 释放资源
+
+        # 清理
         cap.release()
         out.release()
         cv2.destroyAllWindows()
-        self.running = False
-        processor_thread.join()
+        if self.control_panel is not None:
+            self.control_panel.close()
+        print("处理完成")
 
 
 if __name__ == "__main__":
@@ -208,7 +279,7 @@ if __name__ == "__main__":
         precise_model='models/nudenet_640m.engine' # NudeNet 敏感内容检测
     )
     
-    detector.start(
+    detector.run(
         video_source="./test/【兰幼金】夏日辣妹Bubble Pop❤超元气可爱小马达！ P1 横屏   - 0.00.13-0.00.23.mp4",  # 你的视频路径
         output_path="nudenet_result.mp4"
     )
