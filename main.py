@@ -7,7 +7,7 @@ from tkinter import ttk
 class DetectionControlPanel:
     def __init__(self, nudenet_labels, sensitive_labels):
         """
-        GUI 控制面板：先选择要绘制的类别，点击开始后再检测
+        GUI 控制面板：选择遮蔽方式和要处理的类别
 
         Args:
             nudenet_labels: 所有标签列表
@@ -18,12 +18,20 @@ class DetectionControlPanel:
 
         # 创建根窗口
         self.root = tk.Tk()
-        self.root.title("检测框显示控制")
+        self.root.title("检测控制面板")
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._running = True
-        self._started = False  # 是否已点击开始
+        self._started = False
 
-        # 创建变量
+        # 遮蔽方式
+        self._censor_mode = tk.StringVar(value="black")  # black, blur, pixelate, distortion
+        
+        # 遮蔽参数
+        self._blur_kernel = tk.IntVar(value=31)          # 高斯模糊核大小
+        self._pixel_size = tk.IntVar(value=10)           # 像素化块大小
+        self._distortion_strength = tk.IntVar(value=15)  # 失真强度
+        
+        # 标签选择
         self._label_vars = {}
 
         self._build_ui()
@@ -32,22 +40,63 @@ class DetectionControlPanel:
         main_frame = ttk.Frame(self.root, padding=10)
         main_frame.pack(fill=tk.BOTH, expand=True)
 
+        # ========== 遮蔽方式选择 ==========
+        mode_frame = ttk.LabelFrame(main_frame, text="遮蔽方式", padding=10)
+        mode_frame.pack(fill=tk.X, pady=(0, 10))
 
-        ttk.Separator(main_frame).pack(fill=tk.X, pady=5)
+        modes = [
+            ("黑块遮蔽", "black"),
+            ("高斯模糊", "blur"),
+            ("像素化", "pixelate"),
+            ("失真效果", "distortion"),
+        ]
+        
+        for text, value in modes:
+            ttk.Radiobutton(mode_frame, text=text, variable=self._censor_mode, 
+                          value=value, command=self._on_mode_change).pack(anchor='w', pady=2)
 
-        # 逐类别控制
-        detail_frame = ttk.LabelFrame(main_frame, text="逐类别控制", padding=5)
-        detail_frame.pack(fill=tk.BOTH, expand=True)
+        # 参数调节区
+        self.params_frame = ttk.LabelFrame(mode_frame, text="参数调节", padding=5)
+        self.params_frame.pack(fill=tk.X, pady=(10, 0))
+
+        # 高斯模糊参数（默认显示）
+        self.blur_frame = ttk.Frame(self.params_frame)
+        ttk.Label(self.blur_frame, text="模糊核大小 (奇数):").pack(side=tk.LEFT)
+        ttk.Scale(self.blur_frame, from_=5, to=99, variable=self._blur_kernel, 
+                 orient=tk.HORIZONTAL, length=200).pack(side=tk.LEFT, padx=5)
+        ttk.Label(self.blur_frame, textvariable=self._blur_kernel).pack(side=tk.LEFT)
+
+        # 像素化参数
+        self.pixel_frame = ttk.Frame(self.params_frame)
+        ttk.Label(self.pixel_frame, text="像素块大小:").pack(side=tk.LEFT)
+        ttk.Scale(self.pixel_frame, from_=2, to=50, variable=self._pixel_size, 
+                 orient=tk.HORIZONTAL, length=200).pack(side=tk.LEFT, padx=5)
+        ttk.Label(self.pixel_frame, textvariable=self._pixel_size).pack(side=tk.LEFT)
+
+        # 失真参数
+        self.distortion_frame = ttk.Frame(self.params_frame)
+        ttk.Label(self.distortion_frame, text="扭曲强度:").pack(side=tk.LEFT)
+        ttk.Scale(self.distortion_frame, from_=5, to=50, variable=self._distortion_strength, 
+                 orient=tk.HORIZONTAL, length=200).pack(side=tk.LEFT, padx=5)
+        ttk.Label(self.distortion_frame, textvariable=self._distortion_strength).pack(side=tk.LEFT)
+
+        self._on_mode_change()  # 初始化显示
+
+        ttk.Separator(main_frame).pack(fill=tk.X, pady=10)
+
+        # ========== 类别选择 ==========
+        class_frame = ttk.LabelFrame(main_frame, text="选择要遮蔽的类别", padding=5)
+        class_frame.pack(fill=tk.BOTH, expand=True)
 
         # 全选/取消全选按钮
-        btn_frame = ttk.Frame(detail_frame)
+        btn_frame = ttk.Frame(class_frame)
         btn_frame.pack(fill=tk.X, pady=(0, 5))
         ttk.Button(btn_frame, text="全选", command=self._select_all).pack(side=tk.LEFT, padx=(0, 5))
         ttk.Button(btn_frame, text="取消全选", command=self._deselect_all).pack(side=tk.LEFT)
 
         # 画布+滚动条
-        canvas = tk.Canvas(detail_frame, height=400)
-        scrollbar = ttk.Scrollbar(detail_frame, orient=tk.VERTICAL, command=canvas.yview)
+        canvas = tk.Canvas(class_frame, height=300)
+        scrollbar = ttk.Scrollbar(class_frame, orient=tk.VERTICAL, command=canvas.yview)
         scrollable_frame = ttk.Frame(canvas)
 
         scrollable_frame.bind(
@@ -77,8 +126,24 @@ class DetectionControlPanel:
         self.start_btn.pack(pady=5)
 
         # 状态标签
-        self.status_label = ttk.Label(main_frame, text="请在开始前选择要显示的检测框类别", foreground="gray")
+        self.status_label = ttk.Label(main_frame, text="请选择遮蔽方式和要处理的类别后点击开始", foreground="gray")
         self.status_label.pack()
+
+    def _on_mode_change(self):
+        """遮蔽方式改变时显示对应的参数"""
+        mode = self._censor_mode.get()
+        
+        # 隐藏所有参数
+        for frame in [self.blur_frame, self.pixel_frame, self.distortion_frame]:
+            frame.pack_forget()
+        
+        # 显示对应参数
+        if mode == "blur":
+            self.blur_frame.pack(fill=tk.X, pady=5)
+        elif mode == "pixelate":
+            self.pixel_frame.pack(fill=tk.X, pady=5)
+        elif mode == "distortion":
+            self.distortion_frame.pack(fill=tk.X, pady=5)
 
     def _select_all(self):
         for var in self._label_vars.values():
@@ -89,37 +154,49 @@ class DetectionControlPanel:
             var.set(False)
 
     def _on_start(self):
-        """点击开始按钮"""
         self._started = True
         self.start_btn.configure(text="●  检测中...", state="disabled")
         selected_count = sum(1 for v in self._label_vars.values() if v.get())
         self.status_label.configure(
-            text=f"已开始检测 | 选中 {selected_count}/{len(self._label_vars)} 个类别",
+            text=f"已开始 | 遮蔽方式: {self.get_censor_mode_name()} | 选中 {selected_count} 个类别",
             foreground="green"
         )
 
     def is_started(self):
-        """检查是否已点击开始"""
         return self._started
 
     def should_draw(self, class_name):
-        """
-        判断某个检测框是否应该绘制
-        Args:
-            class_name: 类别名称（如 'FEMALE_BREAST_EXPOSED'）
-        Returns:
-            bool: 是否绘制
-        """
+        """判断是否需要对某个类别进行遮蔽"""
         if not self._running:
             return False
-
-        is_sensitive = class_name in self.sensitive_labels
-
-
-        # 逐类别检查
         if class_name in self._label_vars:
             return self._label_vars[class_name].get()
-        return True  # 未知类别默认显示
+        return True
+
+    def get_censor_mode(self):
+        """获取当前遮蔽方式"""
+        return self._censor_mode.get()
+
+    def get_censor_mode_name(self):
+        """获取遮蔽方式中文名"""
+        names = {
+            "black": "黑块",
+            "blur": "高斯模糊",
+            "pixelate": "像素化",
+            "distortion": "失真"
+        }
+        return names.get(self._censor_mode.get(), "未知")
+
+    def get_censor_params(self):
+        """获取当前遮蔽参数"""
+        mode = self._censor_mode.get()
+        if mode == "blur":
+            return {"kernel_size": self._blur_kernel.get()}
+        elif mode == "pixelate":
+            return {"pixel_size": self._pixel_size.get()}
+        elif mode == "distortion":
+            return {"strength": self._distortion_strength.get()}
+        return {}
 
     def update(self):
         """更新 tkinter 事件循环（非阻塞）"""
@@ -135,7 +212,71 @@ class DetectionControlPanel:
         self._running = False
         self.root.destroy()
 
+import cv2
+import numpy as np
 
+class CensorEffects:
+    """遮蔽效果工具类"""
+    
+    @staticmethod
+    def black_block(frame, x1, y1, x2, y2):
+        """黑块遮蔽"""
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 0), -1)
+        return frame
+    
+    @staticmethod
+    def gaussian_blur(frame, x1, y1, x2, y2, kernel_size=31):
+        """高斯模糊遮蔽"""
+        roi = frame[y1:y2, x1:x2]
+        if roi.size == 0:
+            return frame
+        # 确保 kernel_size 为奇数
+        if kernel_size % 2 == 0:
+            kernel_size += 1
+        blurred = cv2.GaussianBlur(roi, (kernel_size, kernel_size), 0)
+        frame[y1:y2, x1:x2] = blurred
+        return frame
+    
+    @staticmethod
+    def pixelate(frame, x1, y1, x2, y2, pixel_size=10):
+        """像素化遮蔽"""
+        roi = frame[y1:y2, x1:x2]
+        if roi.size == 0:
+            return frame
+        h, w = roi.shape[:2]
+        # 缩小
+        temp = cv2.resize(roi, (max(1, w // pixel_size), max(1, h // pixel_size)), 
+                         interpolation=cv2.INTER_LINEAR)
+        # 放大
+        pixelated = cv2.resize(temp, (w, h), interpolation=cv2.INTER_NEAREST)
+        frame[y1:y2, x1:x2] = pixelated
+        return frame
+    
+    @staticmethod
+    def distortion(frame, x1, y1, x2, y2, strength=15):
+        """失真效果（网格扭曲）"""
+        roi = frame[y1:y2, x1:x2]
+        if roi.size == 0:
+            return frame
+        h, w = roi.shape[:2]
+        
+        # 创建网格
+        grid_x, grid_y = np.meshgrid(np.arange(w), np.arange(h))
+        
+        # 添加随机偏移
+        noise_x = np.random.randint(-strength, strength, (h, w))
+        noise_y = np.random.randint(-strength, strength, (h, w))
+        
+        map_x = (grid_x + noise_x).astype(np.float32)
+        map_y = (grid_y + noise_y).astype(np.float32)
+        
+        # 边界裁剪
+        map_x = np.clip(map_x, 0, w - 1)
+        map_y = np.clip(map_y, 0, h - 1)
+        
+        distorted = cv2.remap(roi, map_x, map_y, cv2.INTER_LINEAR)
+        frame[y1:y2, x1:x2] = distorted
+        return frame
 
 
 
@@ -170,23 +311,30 @@ class RealtimeCascadeDetector:
         return f"UNKNOWN_{class_id}"
 
     def draw_results(self, frame, detections):
+        """根据 GUI 选择对检测区域进行遮蔽"""
+        mode = self.control_panel.get_censor_mode()
+        params = self.control_panel.get_censor_params()
+
         for det in detections:
-            # 检查是否应该绘制
+            # 检查是否需要处理
             if self.control_panel is not None and not self.control_panel.should_draw(det['class_name']):
                 continue
+
             x1, y1, x2, y2 = det['bbox']
-            color = (0, 0, 255) if det['is_sensitive'] else (0, 255, 255)
-            thickness = 3 if det['is_sensitive'] else 2
-            cv2.rectangle(frame, (x1, y1), (x2, y2), color, thickness)
 
-            label = f"{det['class_name']}: {det['confidence']:.2f}"
-            if det['is_sensitive']:
-                label = "⚠️ " + label
+            # 根据选择的模式进行遮蔽
+            if mode == "black":
+                CensorEffects.black_block(frame, x1, y1, x2, y2)
+            elif mode == "blur":
+                kernel = params.get("kernel_size", 31)
+                CensorEffects.gaussian_blur(frame, x1, y1, x2, y2, kernel_size=kernel)
+            elif mode == "pixelate":
+                pixel = params.get("pixel_size", 10)
+                CensorEffects.pixelate(frame, x1, y1, x2, y2, pixel_size=pixel)
+            elif mode == "distortion":
+                strength = params.get("strength", 15)
+                CensorEffects.distortion(frame, x1, y1, x2, y2, strength=strength)
 
-            (w, h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 2)
-            cv2.rectangle(frame, (x1, y1 - h - 5), (x1 + w, y1), color, -1)
-            cv2.putText(frame, label, (x1, y1 - 5),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
         return frame
 
     def run(self, video_source=0, output_path="output.mp4"):
