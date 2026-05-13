@@ -7,7 +7,7 @@ from tkinter import ttk
 class DetectionControlPanel:
     def __init__(self, nudenet_labels, sensitive_labels):
         """
-        GUI 控制面板：选择要绘制哪些检测框
+        GUI 控制面板：先选择要绘制的类别，点击开始后再检测
 
         Args:
             nudenet_labels: 所有标签列表
@@ -16,15 +16,15 @@ class DetectionControlPanel:
         self.nudenet_labels = nudenet_labels
         self.sensitive_labels = sensitive_labels
 
-        # 默认全部显示
-        self._show_sensitive = tk.BooleanVar(value=True)
-        self._show_non_sensitive = tk.BooleanVar(value=True)
-        self._label_vars = {}
-
+        # 创建根窗口
         self.root = tk.Tk()
         self.root.title("检测框显示控制")
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._running = True
+        self._started = False  # 是否已点击开始
+
+        # 创建变量
+        self._label_vars = {}
 
         self._build_ui()
 
@@ -32,20 +32,18 @@ class DetectionControlPanel:
         main_frame = ttk.Frame(self.root, padding=10)
         main_frame.pack(fill=tk.BOTH, expand=True)
 
-        # 快捷开关
-        quick_frame = ttk.LabelFrame(main_frame, text="快捷控制", padding=5)
-        quick_frame.pack(fill=tk.X, pady=(0, 10))
-
-        ttk.Checkbutton(quick_frame, text="显示所有敏感框",
-                        variable=self._show_sensitive).pack(anchor='w')
-        ttk.Checkbutton(quick_frame, text="显示所有普通框",
-                        variable=self._show_non_sensitive).pack(anchor='w')
 
         ttk.Separator(main_frame).pack(fill=tk.X, pady=5)
 
         # 逐类别控制
         detail_frame = ttk.LabelFrame(main_frame, text="逐类别控制", padding=5)
         detail_frame.pack(fill=tk.BOTH, expand=True)
+
+        # 全选/取消全选按钮
+        btn_frame = ttk.Frame(detail_frame)
+        btn_frame.pack(fill=tk.X, pady=(0, 5))
+        ttk.Button(btn_frame, text="全选", command=self._select_all).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(btn_frame, text="取消全选", command=self._deselect_all).pack(side=tk.LEFT)
 
         # 画布+滚动条
         canvas = tk.Canvas(detail_frame, height=400)
@@ -72,6 +70,38 @@ class DetectionControlPanel:
             cb = ttk.Checkbutton(scrollable_frame, text=display_text, variable=var)
             cb.pack(anchor='w', pady=1)
 
+        ttk.Separator(main_frame).pack(fill=tk.X, pady=10)
+
+        # 开始按钮
+        self.start_btn = ttk.Button(main_frame, text="▶  开始检测", command=self._on_start)
+        self.start_btn.pack(pady=5)
+
+        # 状态标签
+        self.status_label = ttk.Label(main_frame, text="请在开始前选择要显示的检测框类别", foreground="gray")
+        self.status_label.pack()
+
+    def _select_all(self):
+        for var in self._label_vars.values():
+            var.set(True)
+
+    def _deselect_all(self):
+        for var in self._label_vars.values():
+            var.set(False)
+
+    def _on_start(self):
+        """点击开始按钮"""
+        self._started = True
+        self.start_btn.configure(text="●  检测中...", state="disabled")
+        selected_count = sum(1 for v in self._label_vars.values() if v.get())
+        self.status_label.configure(
+            text=f"已开始检测 | 选中 {selected_count}/{len(self._label_vars)} 个类别",
+            foreground="green"
+        )
+
+    def is_started(self):
+        """检查是否已点击开始"""
+        return self._started
+
     def should_draw(self, class_name):
         """
         判断某个检测框是否应该绘制
@@ -85,11 +115,6 @@ class DetectionControlPanel:
 
         is_sensitive = class_name in self.sensitive_labels
 
-        # 快捷开关检查
-        if is_sensitive and not self._show_sensitive.get():
-            return False
-        if not is_sensitive and not self._show_non_sensitive.get():
-            return False
 
         # 逐类别检查
         if class_name in self._label_vars:
@@ -183,6 +208,21 @@ class RealtimeCascadeDetector:
             nudenet_labels=self.nudenet_labels,
             sensitive_labels=self.sensitive_labels
         )
+
+        # ⚠️ 关键：等待用户点击"开始"按钮
+        print("等待用户选择检测类别并点击开始...")
+        while self.control_panel.is_started() == False:
+            if not self.control_panel.update():
+                print("用户关闭了控制面板，退出程序")
+                cap.release()
+                out.release()
+                cv2.destroyAllWindows()
+                return
+            # 直接休眠，让出 CPU
+            import time
+            time.sleep(0.05)
+
+        print("开始检测！")
 
         while True:
             ret, frame = cap.read()
