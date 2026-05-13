@@ -1,17 +1,19 @@
 from ultralytics import YOLO
 import cv2
-import os
 import tkinter as tk
-from tkinter import ttk
+from tkinter import ttk, filedialog
+import os
+import numpy as np
 
 class DetectionControlPanel:
-    def __init__(self, nudenet_labels, sensitive_labels):
+    def __init__(self, nudenet_labels, sensitive_labels, default_video=""):
         """
         GUI 控制面板：选择遮蔽方式和要处理的类别
 
         Args:
             nudenet_labels: 所有标签列表
             sensitive_labels: 敏感标签列表
+            default_video: 默认视频路径（可选）
         """
         self.nudenet_labels = nudenet_labels
         self.sensitive_labels = sensitive_labels
@@ -23,13 +25,17 @@ class DetectionControlPanel:
         self._running = True
         self._started = False
 
+        # 视频路径
+        self._video_path = tk.StringVar(value=default_video)
+        self._output_path = tk.StringVar(value="output_censored.mp4")
+
         # 遮蔽方式
-        self._censor_mode = tk.StringVar(value="black")  # black, blur, pixelate, distortion
+        self._censor_mode = tk.StringVar(value="black")
         
         # 遮蔽参数
-        self._blur_kernel = tk.IntVar(value=31)          # 高斯模糊核大小
-        self._pixel_size = tk.IntVar(value=10)           # 像素化块大小
-        self._distortion_strength = tk.IntVar(value=15)  # 失真强度
+        self._blur_kernel = tk.IntVar(value=31)
+        self._pixel_size = tk.IntVar(value=10)
+        self._distortion_strength = tk.IntVar(value=15)
         
         # 标签选择
         self._label_vars = {}
@@ -39,6 +45,33 @@ class DetectionControlPanel:
     def _build_ui(self):
         main_frame = ttk.Frame(self.root, padding=10)
         main_frame.pack(fill=tk.BOTH, expand=True)
+
+        # ========== 视频文件选择 ==========
+        video_frame = ttk.LabelFrame(main_frame, text="视频设置", padding=10)
+        video_frame.pack(fill=tk.X, pady=(0, 10))
+
+        # 输入视频
+        input_row = ttk.Frame(video_frame)
+        input_row.pack(fill=tk.X, pady=(0, 5))
+        ttk.Label(input_row, text="输入视频:", width=10).pack(side=tk.LEFT)
+        
+        self.video_entry = ttk.Entry(input_row, textvariable=self._video_path)
+        self.video_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
+        
+        ttk.Button(input_row, text="浏览...", command=self._browse_video).pack(side=tk.RIGHT)
+        ttk.Button(input_row, text="摄像头", command=self._use_camera).pack(side=tk.RIGHT, padx=(0, 5))
+
+        # 输出视频
+        output_row = ttk.Frame(video_frame)
+        output_row.pack(fill=tk.X)
+        ttk.Label(output_row, text="输出视频:", width=10).pack(side=tk.LEFT)
+        
+        self.output_entry = ttk.Entry(output_row, textvariable=self._output_path)
+        self.output_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
+        
+        ttk.Button(output_row, text="浏览...", command=self._browse_output).pack(side=tk.RIGHT)
+
+        ttk.Separator(main_frame).pack(fill=tk.X, pady=10)
 
         # ========== 遮蔽方式选择 ==========
         mode_frame = ttk.LabelFrame(main_frame, text="遮蔽方式", padding=10)
@@ -51,15 +84,20 @@ class DetectionControlPanel:
             ("失真效果", "distortion"),
         ]
         
-        for text, value in modes:
-            ttk.Radiobutton(mode_frame, text=text, variable=self._censor_mode, 
-                          value=value, command=self._on_mode_change).pack(anchor='w', pady=2)
+        # 使用两行两列布局
+        mode_grid = ttk.Frame(mode_frame)
+        mode_grid.pack()
+        for i, (text, value) in enumerate(modes):
+            row, col = i // 2, i % 2
+            ttk.Radiobutton(mode_grid, text=text, variable=self._censor_mode, 
+                          value=value, command=self._on_mode_change).grid(row=row, column=col, 
+                                                                          sticky='w', padx=20, pady=3)
 
         # 参数调节区
         self.params_frame = ttk.LabelFrame(mode_frame, text="参数调节", padding=5)
         self.params_frame.pack(fill=tk.X, pady=(10, 0))
 
-        # 高斯模糊参数（默认显示）
+        # 高斯模糊参数
         self.blur_frame = ttk.Frame(self.params_frame)
         ttk.Label(self.blur_frame, text="模糊核大小 (奇数):").pack(side=tk.LEFT)
         ttk.Scale(self.blur_frame, from_=5, to=99, variable=self._blur_kernel, 
@@ -80,7 +118,7 @@ class DetectionControlPanel:
                  orient=tk.HORIZONTAL, length=200).pack(side=tk.LEFT, padx=5)
         ttk.Label(self.distortion_frame, textvariable=self._distortion_strength).pack(side=tk.LEFT)
 
-        self._on_mode_change()  # 初始化显示
+        self._on_mode_change()
 
         ttk.Separator(main_frame).pack(fill=tk.X, pady=10)
 
@@ -93,6 +131,7 @@ class DetectionControlPanel:
         btn_frame.pack(fill=tk.X, pady=(0, 5))
         ttk.Button(btn_frame, text="全选", command=self._select_all).pack(side=tk.LEFT, padx=(0, 5))
         ttk.Button(btn_frame, text="取消全选", command=self._deselect_all).pack(side=tk.LEFT)
+        ttk.Button(btn_frame, text="仅选敏感", command=self._select_sensitive_only).pack(side=tk.LEFT, padx=(5, 0))
 
         # 画布+滚动条
         canvas = tk.Canvas(class_frame, height=300)
@@ -126,18 +165,60 @@ class DetectionControlPanel:
         self.start_btn.pack(pady=5)
 
         # 状态标签
-        self.status_label = ttk.Label(main_frame, text="请选择遮蔽方式和要处理的类别后点击开始", foreground="gray")
+        self.status_label = ttk.Label(main_frame, text="请选择视频文件、遮蔽方式和要处理的类别后点击开始", foreground="gray")
         self.status_label.pack()
 
+    # ========== 新增方法 ==========
+    
+    def _browse_video(self):
+        """浏览选择视频文件"""
+        filetypes = (
+            ("视频文件", "*.mp4 *.avi *.mov *.mkv *.flv *.wmv"),
+            ("所有文件", "*.*")
+        )
+        filename = filedialog.askopenfilename(
+            title="选择输入视频",
+            filetypes=filetypes,
+            initialdir="."
+        )
+        if filename:
+            self._video_path.set(filename)
+            # 自动生成输出文件名
+            dir_name = os.path.dirname(filename)
+            base_name = os.path.splitext(os.path.basename(filename))[0]
+            self._output_path.set(os.path.join(dir_name, f"{base_name}_censored.mp4"))
+
+    def _browse_output(self):
+        """浏览选择输出路径"""
+        filetypes = (
+            ("MP4 视频", "*.mp4"),
+            ("所有文件", "*.*")
+        )
+        filename = filedialog.asksaveasfilename(
+            title="保存输出视频",
+            filetypes=filetypes,
+            defaultextension=".mp4",
+            initialdir="."
+        )
+        if filename:
+            self._output_path.set(filename)
+
+    def _use_camera(self):
+        """使用摄像头"""
+        self._video_path.set("0")
+        self._output_path.set("camera_output.mp4")
+
+    def _select_sensitive_only(self):
+        """仅选择敏感类别"""
+        for label, var in self._label_vars.items():
+            var.set(label in self.sensitive_labels)
+
+    # ========== 原有方法不变 ==========
+
     def _on_mode_change(self):
-        """遮蔽方式改变时显示对应的参数"""
         mode = self._censor_mode.get()
-        
-        # 隐藏所有参数
         for frame in [self.blur_frame, self.pixel_frame, self.distortion_frame]:
             frame.pack_forget()
-        
-        # 显示对应参数
         if mode == "blur":
             self.blur_frame.pack(fill=tk.X, pady=5)
         elif mode == "pixelate":
@@ -154,11 +235,23 @@ class DetectionControlPanel:
             var.set(False)
 
     def _on_start(self):
+        # 检查视频路径
+        video_path = self._video_path.get().strip()
+        if not video_path:
+            self.status_label.configure(text="请先选择输入视频文件！", foreground="red")
+            return
+        
+        if video_path != "0" and not os.path.exists(video_path):
+            self.status_label.configure(text=f"视频文件不存在: {video_path}", foreground="red")
+            return
+
         self._started = True
         self.start_btn.configure(text="●  检测中...", state="disabled")
         selected_count = sum(1 for v in self._label_vars.values() if v.get())
+        
+        video_display = "摄像头" if video_path == "0" else os.path.basename(video_path)
         self.status_label.configure(
-            text=f"已开始 | 遮蔽方式: {self.get_censor_mode_name()} | 选中 {selected_count} 个类别",
+            text=f"已开始 | 视频: {video_display} | 遮蔽: {self.get_censor_mode_name()} | 选中 {selected_count} 个类别",
             foreground="green"
         )
 
@@ -166,7 +259,6 @@ class DetectionControlPanel:
         return self._started
 
     def should_draw(self, class_name):
-        """判断是否需要对某个类别进行遮蔽"""
         if not self._running:
             return False
         if class_name in self._label_vars:
@@ -174,11 +266,9 @@ class DetectionControlPanel:
         return True
 
     def get_censor_mode(self):
-        """获取当前遮蔽方式"""
         return self._censor_mode.get()
 
     def get_censor_mode_name(self):
-        """获取遮蔽方式中文名"""
         names = {
             "black": "黑块",
             "blur": "高斯模糊",
@@ -188,7 +278,6 @@ class DetectionControlPanel:
         return names.get(self._censor_mode.get(), "未知")
 
     def get_censor_params(self):
-        """获取当前遮蔽参数"""
         mode = self._censor_mode.get()
         if mode == "blur":
             return {"kernel_size": self._blur_kernel.get()}
@@ -198,8 +287,18 @@ class DetectionControlPanel:
             return {"strength": self._distortion_strength.get()}
         return {}
 
+    def get_video_path(self):
+        """获取视频路径（字符串 "0" 表示摄像头）"""
+        path = self._video_path.get().strip()
+        if path == "0":
+            return 0  # 摄像头
+        return path
+
+    def get_output_path(self):
+        """获取输出路径"""
+        return self._output_path.get().strip()
+
     def update(self):
-        """更新 tkinter 事件循环（非阻塞）"""
         if self._running:
             self.root.update()
         return self._running
@@ -211,9 +310,6 @@ class DetectionControlPanel:
     def close(self):
         self._running = False
         self.root.destroy()
-
-import cv2
-import numpy as np
 
 class CensorEffects:
     """遮蔽效果工具类"""
@@ -337,10 +433,40 @@ class RealtimeCascadeDetector:
 
         return frame
 
-    def run(self, video_source=0, output_path="output.mp4"):
+    def run(self):
+        """启动检测（视频路径从 GUI 获取）"""
+        import time
+
+        # 初始化控制面板
+        self.control_panel = DetectionControlPanel(
+            nudenet_labels=self.nudenet_labels,
+            sensitive_labels=self.sensitive_labels,
+            default_video="./test/【兰幼金】夏日辣妹Bubble Pop❤超元气可爱小马达！ P1 横屏   - 0.00.13-0.00.23.mp4"  # 可选默认值
+        )
+
+        # 等待用户点击开始
+        print("等待用户选择视频并点击开始...")
+        while not self.control_panel.is_started():
+            if not self.control_panel.update():
+                print("用户关闭了控制面板，退出程序")
+                return
+            time.sleep(0.05)
+
+        # 获取用户选择的路径
+        video_source = self.control_panel.get_video_path()
+        output_path = self.control_panel.get_output_path()
+
+        print(f"输入视频: {video_source}")
+        print(f"输出视频: {output_path}")
+        print("开始检测！")
+
+        # 打开视频源
         cap = cv2.VideoCapture(video_source)
         if not cap.isOpened():
             print(f"无法打开视频源: {video_source}")
+            self.control_panel.status_label.configure(
+                text=f"无法打开视频源: {video_source}", foreground="red"
+            )
             return
 
         fps = cap.get(cv2.CAP_PROP_FPS)
@@ -351,30 +477,11 @@ class RealtimeCascadeDetector:
 
         os.makedirs('./debug_roi', exist_ok=True)
         frame_id = 0
-        # 新增：初始化控制面板
-        self.control_panel = DetectionControlPanel(
-            nudenet_labels=self.nudenet_labels,
-            sensitive_labels=self.sensitive_labels
-        )
-
-        # ⚠️ 关键：等待用户点击"开始"按钮
-        print("等待用户选择检测类别并点击开始...")
-        while self.control_panel.is_started() == False:
-            if not self.control_panel.update():
-                print("用户关闭了控制面板，退出程序")
-                cap.release()
-                out.release()
-                cv2.destroyAllWindows()
-                return
-            # 直接休眠，让出 CPU
-            import time
-            time.sleep(0.05)
-
-        print("开始检测！")
 
         while True:
             ret, frame = cap.read()
             if not ret:
+                print("视频播放完毕" if video_source != 0 else "摄像头断开")
                 break
 
             # ----------------- 第一阶段：检测人 -----------------
@@ -438,21 +545,19 @@ class RealtimeCascadeDetector:
                                         cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
                     cv2.imwrite(f'./debug_roi/debug_roi_{frame_id}_{idx}.jpg', roi_annotated)
 
-        # ----------------- 绘制并保存 -----------------
+            # 绘制并保存
             annotated = self.draw_results(frame, final_detections)
             out.write(annotated)
             cv2.imshow('Cascade Detection', annotated)
             frame_id += 1
 
-            # 新增：更新控制面板（替代原有简单的 waitKey）
+            # 更新控制面板
             if not self.control_panel.update():
-                break  # GUI 关闭时退出循环
+                break
 
-            # 仍然保留键盘退出方式
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
 
-        # 清理
         cap.release()
         out.release()
         cv2.destroyAllWindows()
@@ -463,11 +568,7 @@ class RealtimeCascadeDetector:
 
 if __name__ == "__main__":
     detector = RealtimeCascadeDetector(
-        fast_model='models/yolo26n.engine',           # 快速检测人
-        precise_model='models/nudenet_640m.engine' # NudeNet 敏感内容检测
+        fast_model='models/yolo26n.engine',
+        precise_model='models/nudenet_640m.engine'
     )
-    
-    detector.run(
-        video_source="./test/【兰幼金】夏日辣妹Bubble Pop❤超元气可爱小马达！ P1 横屏   - 0.00.13-0.00.23.mp4",  # 你的视频路径
-        output_path="nudenet_result.mp4"
-    )
+    detector.run()  # 不需要传参了，全部从 GUI 获取
