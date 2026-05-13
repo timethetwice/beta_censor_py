@@ -81,10 +81,15 @@ class RealtimeCascadeDetector:
                 
                 # 第二阶段：NudeNet 敏感内容检测
                 final_results = []
-                for (x1, y1, x2, y2) in candidates:
+                for idx, (x1, y1, x2, y2) in enumerate(candidates):  # 添加 idx
                     roi = frame[y1:y2, x1:x2]
                     if roi.size == 0:
                         continue
+                    
+                    # 每30帧保存一次 ROI（调试用）
+                    if frame_id % 30 == 0:
+                        cv2.imwrite(f'./debug_roi/debug_roi_{frame_id}_{idx}.jpg', roi)
+                        # print(f"保存 ROI: debug_roi_{frame_id}_{idx}.jpg, 尺寸 {roi.shape[1]}x{roi.shape[0]}")
                     
                     # 使用 NudeNet 模型检测
                     precise_results = self.precise_model(roi, conf=0.3)
