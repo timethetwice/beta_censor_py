@@ -4,6 +4,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog
 import os
 import numpy as np
+import subprocess
 
 class DetectionControlPanel:
     def __init__(self, nudenet_labels, sensitive_labels, female_sensitive_labels, default_video=""):
@@ -453,6 +454,18 @@ class RealtimeCascadeDetector:
         # 遮蔽缓冲区：保存最近 N 帧的检测结果
         self.censor_buffer = []          # 列表，每个元素是 (剩余帧数, detections)
         self.buffer_frames = 5           # 缓冲帧数
+        # 检查 ffmpeg 是否可用
+        self.has_ffmpeg = self._check_ffmpeg()
+    
+    @staticmethod
+    def _check_ffmpeg():
+        """检查 ffmpeg 是否可用"""
+        try:
+            subprocess.run(['ffmpeg', '-version'], capture_output=True, check=True)
+            return True
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            print("警告: 未找到 ffmpeg，输出视频将没有音频")
+            return False
 
     def get_label_name(self, class_id):
         if 0 <= class_id < len(self.nudenet_labels):
@@ -561,6 +574,51 @@ class RealtimeCascadeDetector:
         self.censor_buffer = new_buffer
 
         return frame
+    
+    def _merge_audio(self, video_source, output_path):
+        """用 ffmpeg 将原视频的音频合并到输出视频"""
+        import subprocess
+        import os
+        
+        temp_video = output_path
+        final_video = output_path.replace('.mp4', '_with_audio.mp4')
+        
+        try:
+            # 检查原视频是否有音频
+            probe_cmd = [
+                'ffprobe', '-v', 'error', '-select_streams', 'a:0',
+                '-show_entries', 'stream=codec_type',
+                '-of', 'csv=p=0', video_source
+            ]
+            result = subprocess.run(probe_cmd, capture_output=True, text=True)
+            
+            if 'audio' not in result.stdout:
+                print("原视频没有音频轨道，跳过音频合并")
+                return
+            
+            # 合并视频和音频
+            merge_cmd = [
+                'ffmpeg', '-y',  # -y 覆盖输出文件
+                '-i', temp_video,      # 输入：无声视频
+                '-i', video_source,    # 输入：原视频（取其音频）
+                '-c:v', 'copy',        # 视频直接复制
+                '-c:a', 'aac',         # 音频编码为 AAC
+                '-map', '0:v:0',       # 使用第一个输入的视频流
+                '-map', '1:a:0',       # 使用第二个输入的音频流
+                '-shortest',           # 以较短的流为准
+                final_video
+            ]
+            
+            print("正在合并音频...")
+            subprocess.run(merge_cmd, capture_output=True, check=True)
+            
+            # 替换原文件
+            os.replace(final_video, output_path)
+            print(f"音频合并完成: {output_path}")
+            
+        except subprocess.CalledProcessError as e:
+            print(f"音频合并失败: {e.stderr.decode() if e.stderr else str(e)}")
+            print(f"无声视频已保存为: {output_path}")
 
     def run(self):
         """启动检测（视频路径从 GUI 获取）"""
@@ -692,6 +750,13 @@ class RealtimeCascadeDetector:
         cap.release()
         out.release()
         cv2.destroyAllWindows()
+        # 合并音频
+        if self.has_ffmpeg and video_source != 0:  # 摄像头没有音频文件
+            self._merge_audio(video_source, output_path)
+        
+        if self.control_panel is not None:
+            self.control_panel.close()
+        print("处理完成")
         if self.control_panel is not None:
             self.control_panel.close()
         print("处理完成")
