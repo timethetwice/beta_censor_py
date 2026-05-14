@@ -31,7 +31,8 @@ class DetectionControlPanel:
         self._running = True
         self._started = False
 
-        # 视频路径
+        # 视频路径 - 支持多文件
+        self._video_paths = []  # 文件列表
         self._video_path = tk.StringVar(value=default_video)
         self._output_path = tk.StringVar(value="output_censored.mp4")
 
@@ -39,7 +40,7 @@ class DetectionControlPanel:
         self._censor_mode = tk.StringVar(value="black")
         
         # 遮蔽参数
-        self._blur_kernel = tk.IntVar(value=31)
+        self._blur_kernel = tk.IntVar(value=81)
         self._pixel_size = tk.IntVar(value=13)
         self._distortion_strength = tk.IntVar(value=15)
         self._buffer_frames = tk.IntVar(value=5)  
@@ -66,7 +67,7 @@ class DetectionControlPanel:
         self.video_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
         
         ttk.Button(input_row, text="浏览...", command=self._browse_video).pack(side=tk.RIGHT)
-        ttk.Button(input_row, text="摄像头", command=self._use_camera).pack(side=tk.RIGHT, padx=(0, 5))
+        ttk.Button(input_row, text="摄像头", command=self._use_camera).pack(side=tk.RIGHT, padx=(0, 10))
 
         # 输出视频
         output_row = ttk.Frame(video_frame)
@@ -214,21 +215,25 @@ class DetectionControlPanel:
     # ========== 新增方法 ==========
     
     def _browse_video(self):
-        """浏览选择视频文件"""
-        filetypes = (
-            ("视频文件", "*.mp4 *.avi *.mov *.mkv *.flv *.wmv"),
-            ("所有文件", "*.*")
-        )
-        filename = filedialog.askopenfilename(
-            title="选择输入视频",
-            filetypes=filetypes,
-            initialdir="."
-        )
-        if filename:
-            self._video_path.set(filename)
-            # 自动生成输出文件名
-            dir_name = os.path.dirname(filename)
-            base_name = os.path.splitext(os.path.basename(filename))[0]
+        """浏览选择视频文件（自动判断文件或文件夹）"""
+        initial = self._output_path.get().strip() or "."
+        selection = filedialog.askopenfilename(title="选择视频文件或文件夹", initialdir=initial)
+        if not selection:
+            return
+        
+        if os.path.isdir(selection):
+            self._video_paths = []
+            for f in sorted(os.listdir(selection)):
+                if f.lower().endswith(('.mp4', '.avi', '.mov', '.mkv', '.flv', '.wmv')):
+                    self._video_paths.append(os.path.join(selection, f))
+            count = len(self._video_paths)
+            self._video_path.set(f"📁 {count} 个视频" if count else "📁 空文件夹")
+            self._output_path.set(selection)
+        else:
+            self._video_path.set(selection)
+            self._video_paths = [selection]
+            dir_name = os.path.dirname(selection)
+            base_name = os.path.splitext(os.path.basename(selection))[0]
             self._output_path.set(os.path.join(dir_name, f"{base_name}_censored.mp4"))
 
     def _browse_output(self):
@@ -253,7 +258,8 @@ class DetectionControlPanel:
 
     def _use_camera(self):
         """使用摄像头"""
-        self._video_path.set("0")
+        self._video_path.set("摄像头模式")
+        self._video_paths = ["0"]
         self._output_path.set("camera_output.mp4")
 
     def _select_sensitive_only(self):
@@ -298,23 +304,20 @@ class DetectionControlPanel:
             var.set(False)
 
     def _on_start(self):
-        # 检查视频路径
-        video_path = self._video_path.get().strip()
-        if not video_path:
-            self.status_label.configure(text="请先选择输入视频文件！", foreground="red")
+        if self._video_path.get() == "摄像头模式":
+            video_paths = ["0"]
+        elif not self._video_paths:
+            self.status_label.configure(text="请先选择视频文件！", foreground="red")
             return
-        
-        if video_path != "0" and not os.path.exists(video_path):
-            self.status_label.configure(text=f"视频文件不存在: {video_path}", foreground="red")
-            return
+        else:
+            video_paths = self._video_paths
 
         self._started = True
         self.start_btn.configure(text="●  检测中...", state="disabled")
         selected_count = sum(1 for v in self._label_vars.values() if v.get())
-        
-        video_display = "摄像头" if video_path == "0" else os.path.basename(video_path)
+        total = len(video_paths) if video_paths[0] != "0" else 1
         self.status_label.configure(
-            text=f"已开始 | 视频: {video_display} | 遮蔽: {self.get_censor_mode_name()} | 选中 {selected_count} 个类别",
+            text=f"已开始 | 视频: {'摄像头' if video_paths[0] == '0' else f'{total}个文件'} | 遮蔽: {self.get_censor_mode_name()} | 选中 {selected_count} 个类别",
             foreground="green"
         )
 
@@ -350,16 +353,15 @@ class DetectionControlPanel:
             return {"strength": self._distortion_strength.get()}
         return {}
 
-    def get_video_path(self):
-        """获取视频路径（字符串 "0" 表示摄像头）"""
-        path = self._video_path.get().strip()
-        if path == "0":
-            return 0  # 摄像头
-        return path
-
     def get_output_path(self):
         """获取输出路径"""
         return self._output_path.get().strip()
+
+    def get_video_path(self):
+        """获取视频路径列表"""
+        if self._video_path.get() == "摄像头模式":
+            return ["0"]
+        return self._video_paths if self._video_paths else []
 
     def update(self):
         if self._running:
@@ -384,15 +386,35 @@ class CensorEffects:
         return frame
     
     @staticmethod
-    def gaussian_blur(frame, x1, y1, x2, y2, kernel_size=31):
-        """高斯模糊遮蔽"""
+    def gaussian_blur(frame, x1, y1, x2, y2, kernel_size=81):
+        """高斯模糊遮蔽（缩小加速版）"""
         roi = frame[y1:y2, x1:x2]
         if roi.size == 0:
             return frame
-        # 确保 kernel_size 为奇数
+        
         if kernel_size % 2 == 0:
             kernel_size += 1
-        blurred = cv2.GaussianBlur(roi, (kernel_size, kernel_size), 0)
+        
+        h, w = roi.shape[:2]
+        
+        # 缩小因子（根据区域大小动态调整）
+        if max(w, h) > 100:
+            scale = 0.1  # 缩小到 1/10
+        else:
+            scale = 0.5   # 小区域不缩太小
+        
+        small_w = max(1, int(w * scale))
+        small_h = max(1, int(h * scale))
+        small_roi = cv2.resize(roi, (small_w, small_h), interpolation=cv2.INTER_LINEAR)
+        
+        # 核也等比缩小
+        small_kernel = max(3, int(kernel_size * scale))
+        if small_kernel % 2 == 0:
+            small_kernel += 1
+        
+        blurred_small = cv2.GaussianBlur(small_roi, (small_kernel, small_kernel), 0)
+        blurred = cv2.resize(blurred_small, (w, h), interpolation=cv2.INTER_LINEAR)
+        
         frame[y1:y2, x1:x2] = blurred
         return frame
     
@@ -661,7 +683,11 @@ class RealtimeCascadeDetector:
     def _process_video(self, video_source, output_path, preview):
         """处理单个视频，返回是否正常完成"""
         import time
-        cap = cv2.VideoCapture(video_source)
+        
+        if video_source == 0:
+            cap = cv2.VideoCapture(0)
+        else:
+            cap = cv2.VideoCapture(video_source)
         if not cap.isOpened():
             print(f"无法打开视频源: {video_source}")
             return
@@ -788,7 +814,7 @@ class RealtimeCascadeDetector:
         if preview:
             cv2.destroyAllWindows()
         
-        # 合并音频（如果有 ffmpeg）
+        # 合并音频（如果有 ffmpeg 且非摄像头）
         if self.has_ffmpeg and video_source != 0:
             self._merge_audio(video_source, output_path)
         
@@ -817,11 +843,43 @@ class RealtimeCascadeDetector:
             time.sleep(0.05)
         
         while True:
-            video_source = self.control_panel.get_video_path()
-            output_path = self.control_panel.get_output_path()
+            video_sources = self.control_panel.get_video_path()
+            output_base = self.control_panel.get_output_path()
             preview = self.control_panel.get_preview()
             
-            success = self._process_video(video_source, output_path, preview)
+            # 判断处理模式
+            if not video_sources or video_sources == ["0"]:
+                # 摄像头模式
+                self._process_video(0, "camera_output.mp4", preview)
+                success = True
+            elif len(video_sources) == 1:
+                # 单文件
+                video_path = video_sources[0]
+                if video_path.endswith("_censored.mp4"):
+                    output_path = video_path
+                else:
+                    dir_name = os.path.dirname(video_path)
+                    base_name = os.path.splitext(os.path.basename(video_path))[0]
+                    output_path = os.path.join(dir_name, f"{base_name}_censored.mp4")
+                self._process_video(video_path, output_path, preview)
+                success = True
+            else:
+                # 多文件或文件夹
+                for i, video_source in enumerate(video_sources):
+                    dir_name = os.path.dirname(video_source) if os.path.dirname(video_source) else "."
+                    base_name = os.path.splitext(os.path.basename(video_source))[0]
+                    output_path = os.path.join(dir_name, f"{base_name}_censored.mp4")
+                    
+                    if i > 0 and preview:
+                        cv2.destroyAllWindows()
+                    
+                    self.control_panel.status_label.configure(
+                        text=f"处理中 [{i+1}/{len(video_sources)}]: {os.path.basename(video_source)}",
+                        foreground="orange"
+                    )
+                    self.control_panel.update()
+                    self._process_video(video_source, output_path, preview and i == len(video_sources) - 1)
+                success = True
             
             # 恢复 GUI 状态
             self.control_panel._started = False
@@ -829,12 +887,12 @@ class RealtimeCascadeDetector:
             
             if success:
                 self.control_panel.status_label.configure(
-                    text=f"处理完成！输出: {os.path.basename(output_path)} | 可重新选择视频并开始",
+                    text=f"处理完成！共处理 {len(video_sources) if video_sources and video_sources[0] != '0' else 0} 个视频 | 可重新选择视频并开始",
                     foreground="blue"
                 )
             else:
                 self.control_panel.status_label.configure(
-                    text=f"无法打开视频源: {video_source}", foreground="red"
+                    text=f"无法打开视频源", foreground="red"
                 )
             
             print("GUI 窗口保持打开，可重新选择视频开始检测，或关闭窗口退出")
