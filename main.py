@@ -80,6 +80,13 @@ class DetectionControlPanel:
 
         ttk.Separator(main_frame).pack(fill=tk.X, pady=10)
 
+        # 预览开关
+        preview_row = ttk.Frame(video_frame)
+        preview_row.pack(fill=tk.X, pady=(5, 0))
+        self._show_preview = tk.BooleanVar(value=True)
+        ttk.Checkbutton(preview_row, text="显示预览窗口（关闭可加速）", 
+                        variable=self._show_preview).pack(side=tk.LEFT)
+
         # ========== 遮蔽方式选择 ==========
         mode_frame = ttk.LabelFrame(main_frame, text="遮蔽方式", padding=10)
         mode_frame.pack(fill=tk.X, pady=(0, 10))
@@ -238,6 +245,11 @@ class DetectionControlPanel:
         )
         if filename:
             self._output_path.set(filename)
+
+                    
+    def get_preview(self):
+        """获取是否显示预览"""
+        return self._show_preview.get()
 
     def _use_camera(self):
         """使用摄像头"""
@@ -644,44 +656,18 @@ class RealtimeCascadeDetector:
             print(f"音频合并失败: {e.stderr.decode() if e.stderr else str(e)}")
             print(f"无声视频已保存为: {output_path}")
 
-    def run(self):
-        """启动检测（视频路径从 GUI 获取）"""
+
+
+    def _process_video(self, video_source, output_path, preview):
+        """处理单个视频，返回是否正常完成"""
         import time
-
-        # 初始化控制面板
-        self.control_panel = DetectionControlPanel(
-            nudenet_labels=self.nudenet_labels,
-            sensitive_labels=self.sensitive_labels,
-            female_sensitive_labels = self.female_sensitive_labels,
-            default_video="./test/【兰幼金】夏日辣妹Bubble Pop❤超元气可爱小马达！ P1 横屏   - 0.00.13-0.00.23.mp4"  # 可选默认值
-        )
-
-        # 等待用户点击开始
-        print("等待用户选择视频并点击开始...")
-        while not self.control_panel.is_started():
-            if not self.control_panel.update():
-                print("用户关闭了控制面板，退出程序")
-                return
-            time.sleep(0.05)
-
-        # 获取用户选择的路径
-        video_source = self.control_panel.get_video_path()
-        output_path = self.control_panel.get_output_path()
-
-        print(f"输入视频: {video_source}")
-        print(f"输出视频: {output_path}")
-        print("开始检测！")
-
-        # 打开视频源
         cap = cv2.VideoCapture(video_source)
         if not cap.isOpened():
             print(f"无法打开视频源: {video_source}")
-            self.control_panel.status_label.configure(
-                text=f"无法打开视频源: {video_source}", foreground="red"
-            )
             return
 
         fps = cap.get(cv2.CAP_PROP_FPS)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         fourcc = cv2.VideoWriter_fourcc(*'mp4v')
@@ -689,11 +675,16 @@ class RealtimeCascadeDetector:
 
         os.makedirs('./debug_roi', exist_ok=True)
         frame_id = 0
+        self.censor_buffer = []
+
+        # FPS 计时
+        fps_start_time = time.time()
+        fps_frame_count = 0
+        current_fps = 0.0
 
         while True:
             ret, frame = cap.read()
             if not ret:
-                print("视频播放完毕" if video_source != 0 else "摄像头断开")
                 break
 
             # ----------------- 第一阶段：检测人 -----------------
@@ -761,26 +752,105 @@ class RealtimeCascadeDetector:
             # 绘制并保存
             annotated = self.draw_results(frame, final_detections)
             out.write(annotated)
-            cv2.imshow('Cascade Detection', annotated)
+
+            # FPS 计算（每 10 帧更新一次）
+            fps_frame_count += 1
+            if fps_frame_count >= 10:
+                elapsed = time.time() - fps_start_time
+                current_fps = fps_frame_count / elapsed
+                fps_start_time = time.time()
+                fps_frame_count = 0
+
+            # 在帧上绘制 FPS
+            fps_text = f"FPS: {current_fps:.1f}"
+
+            # 预览（可选）
+            if preview:
+                cv2.putText(annotated, fps_text, (10, 30), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                cv2.imshow('Cascade Detection', annotated)
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
+
+            # 控制台进度（每 100 帧打印一次）
             frame_id += 1
+            if frame_id % 100 == 0 and total_frames > 0:
+                progress = frame_id / total_frames * 100
+                print(f"进度: {progress:.1f}% | 帧: {frame_id}/{total_frames} | FPS: {current_fps:.1f}")
 
             # 更新控制面板
             if not self.control_panel.update():
                 break
 
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
-
+        # 最终统计
         cap.release()
         out.release()
-        cv2.destroyAllWindows()
-        # 合并音频
-        if self.has_ffmpeg and video_source != 0:  # 摄像头没有音频文件
+        if preview:
+            cv2.destroyAllWindows()
+        
+        # 合并音频（如果有 ffmpeg）
+        if self.has_ffmpeg and video_source != 0:
             self._merge_audio(video_source, output_path)
         
-        if self.control_panel is not None:
-            self.control_panel.close()
-        print("处理完成")
+        # 不关闭控制面板，只更新状态
+        self.control_panel.status_label.configure(
+            text=f"处理完成！输出: {os.path.basename(output_path)}",
+            foreground="blue"
+        )
+        return True
+
+    def run(self):
+        import time
+        
+        self.control_panel = DetectionControlPanel(
+            nudenet_labels=self.nudenet_labels,
+            sensitive_labels=self.sensitive_labels,
+            female_sensitive_labels = self.female_sensitive_labels,
+            default_video="..."
+        )
+        
+        print("等待用户选择视频并点击开始...")
+        while not self.control_panel.is_started():
+            if not self.control_panel.update():
+                print("用户关闭了控制面板，退出程序")
+                return
+            time.sleep(0.05)
+        
+        while True:
+            video_source = self.control_panel.get_video_path()
+            output_path = self.control_panel.get_output_path()
+            preview = self.control_panel.get_preview()
+            
+            success = self._process_video(video_source, output_path, preview)
+            
+            # 恢复 GUI 状态
+            self.control_panel._started = False
+            self.control_panel.start_btn.configure(text="▶  开始检测", state="normal")
+            
+            if success:
+                self.control_panel.status_label.configure(
+                    text=f"处理完成！输出: {os.path.basename(output_path)} | 可重新选择视频并开始",
+                    foreground="blue"
+                )
+            else:
+                self.control_panel.status_label.configure(
+                    text=f"无法打开视频源: {video_source}", foreground="red"
+                )
+            
+            print("GUI 窗口保持打开，可重新选择视频开始检测，或关闭窗口退出")
+            
+            # 等待用户再次点击开始或关闭窗口
+            while not self.control_panel.is_started():
+                if not self.control_panel.update():
+                    print("程序退出")
+                    return
+                time.sleep(0.05)
+        
+        self.control_panel.close()
+        print("程序退出")
+
+
+
 
 
 if __name__ == "__main__":
