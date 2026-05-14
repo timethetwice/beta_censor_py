@@ -38,6 +38,7 @@ class DetectionControlPanel:
         self._blur_kernel = tk.IntVar(value=31)
         self._pixel_size = tk.IntVar(value=10)
         self._distortion_strength = tk.IntVar(value=15)
+        self._buffer_frames = tk.IntVar(value=5)  
         
         # 标签选择
         self._label_vars = {}
@@ -102,8 +103,15 @@ class DetectionControlPanel:
         # 高斯模糊参数
         self.blur_frame = ttk.Frame(self.params_frame)
         ttk.Label(self.blur_frame, text="模糊核大小 (奇数):").pack(side=tk.LEFT)
-        ttk.Scale(self.blur_frame, from_=5, to=99, variable=self._blur_kernel, 
-                 orient=tk.HORIZONTAL, length=200).pack(side=tk.LEFT, padx=5)
+        ttk.Scale(
+            self.blur_frame, 
+            from_=5, 
+            to=99, 
+            variable=self._blur_kernel, 
+            orient=tk.HORIZONTAL, 
+            length=200,
+            command=lambda v: self._blur_kernel.set(int(float(v)) | 1)  # 强制奇数
+        ).pack(side=tk.LEFT, padx=5)
         ttk.Label(self.blur_frame, textvariable=self._blur_kernel).pack(side=tk.LEFT)
 
         # 像素化参数
@@ -119,6 +127,23 @@ class DetectionControlPanel:
         ttk.Scale(self.distortion_frame, from_=5, to=50, variable=self._distortion_strength, 
                  orient=tk.HORIZONTAL, length=200).pack(side=tk.LEFT, padx=5)
         ttk.Label(self.distortion_frame, textvariable=self._distortion_strength).pack(side=tk.LEFT)
+
+        # 缓冲帧数（始终显示，所有模式通用）
+        self.buffer_frame = ttk.Frame(self.params_frame)
+        ttk.Label(self.buffer_frame, text="缓冲帧数:").pack(side=tk.LEFT)
+        ttk.Scale(
+            self.buffer_frame, 
+            from_=0, 
+            to=30, 
+            variable=self._buffer_frames, 
+            orient=tk.HORIZONTAL, 
+            length=200,
+            command=lambda v: self._buffer_frames.set(int(float(v)))  # 强制取整
+        ).pack(side=tk.LEFT, padx=5)
+        ttk.Label(self.buffer_frame, textvariable=self._buffer_frames).pack(side=tk.LEFT)
+
+        # 初始显示缓冲帧数
+        self.buffer_frame.pack(fill=tk.X, pady=5)
 
         self._on_mode_change()
 
@@ -220,19 +245,30 @@ class DetectionControlPanel:
         for label, var in self._label_vars.items():
             var.set(label in self.female_sensitive_labels)
 
-    # ========== 原有方法不变 ==========
-
     def _on_mode_change(self):
+        """遮蔽方式改变时显示对应的参数，缓冲帧数始终显示"""
         mode = self._censor_mode.get()
+        
+        # 隐藏所有特定模式参数
         for frame in [self.blur_frame, self.pixel_frame, self.distortion_frame]:
             frame.pack_forget()
+        self.buffer_frame.pack_forget()
+        
+        # 显示对应参数
         if mode == "blur":
             self.blur_frame.pack(fill=tk.X, pady=5)
         elif mode == "pixelate":
             self.pixel_frame.pack(fill=tk.X, pady=5)
         elif mode == "distortion":
             self.distortion_frame.pack(fill=tk.X, pady=5)
+        
+        # 缓冲帧数始终显示
+        self.buffer_frame.pack(fill=tk.X, pady=5)
 
+    def get_buffer_frames(self):
+        """获取缓冲帧数"""
+        return self._buffer_frames.get()
+    
     def _select_all(self):
         for var in self._label_vars.values():
             var.set(True)
@@ -414,6 +450,10 @@ class RealtimeCascadeDetector:
         # 新增：控制面板（延迟初始化，避免影响模型加载）
         self.control_panel = None
 
+        # 遮蔽缓冲区：保存最近 N 帧的检测结果
+        self.censor_buffer = []          # 列表，每个元素是 (剩余帧数, detections)
+        self.buffer_frames = 5           # 缓冲帧数
+
     def get_label_name(self, class_id):
         if 0 <= class_id < len(self.nudenet_labels):
             return self.nudenet_labels[class_id]
@@ -457,6 +497,7 @@ class RealtimeCascadeDetector:
         """根据 GUI 选择对检测区域进行遮蔽，合并同 ROI 内的 breast 框"""
         mode = self.control_panel.get_censor_mode()
         params = self.control_panel.get_censor_params()
+        buffer_frames = self.control_panel.get_buffer_frames()
 
         # 第一步：找出所有 breast 相关的框，进行合并
         breast_labels = ["FEMALE_BREAST_EXPOSED", "FEMALE_BREAST_COVERED","MALE_BREAST_EXPOSED"]
@@ -471,14 +512,27 @@ class RealtimeCascadeDetector:
             else:
                 other_detections.append(det)
         
-        # 合并 breast 框（如果同一 ROI 有多个）
         merged_breast = self._merge_breast_boxes(breast_detections)
+        current_detections = merged_breast + other_detections
+
+        # ========== 更新缓冲区 ==========
+        if buffer_frames > 0:
+            self.censor_buffer.append((buffer_frames, current_detections))
+
+        # ========== 收集所有需要遮蔽的框 ==========
+        all_boxes = []
         
-        # 合并所有需要处理的检测
-        all_processed = merged_breast + other_detections
+        # 如果缓冲帧数 > 0，使用缓冲
+        if buffer_frames > 0:
+            for remaining, dets in self.censor_buffer:
+                for det in dets:
+                    all_boxes.append(det)
+        else:
+            # 缓冲帧数为 0，只使用当前帧
+            all_boxes = current_detections
 
         # 第二步：对所有检测进行遮蔽
-        for det in all_processed:
+        for det in all_boxes:
             # 检查是否需要处理
             if self.control_panel is not None and not self.control_panel.should_draw(det['class_name']):
                 continue
@@ -497,6 +551,14 @@ class RealtimeCascadeDetector:
             elif mode == "distortion":
                 strength = params.get("strength", 15)
                 CensorEffects.distortion(frame, x1, y1, x2, y2, strength=strength)
+
+        # ========== 更新缓冲区：减少剩余帧数，移除过期条目 ==========
+        new_buffer = []
+        for remaining, dets in self.censor_buffer:
+            remaining -= 1
+            if remaining > 0:
+                new_buffer.append((remaining, dets))
+        self.censor_buffer = new_buffer
 
         return frame
 
