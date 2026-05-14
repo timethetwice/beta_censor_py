@@ -5,6 +5,9 @@ from tkinter import ttk, filedialog
 import os
 import numpy as np
 import subprocess
+import platform
+
+
 
 class DetectionControlPanel:
     def __init__(self, nudenet_labels, sensitive_labels, female_sensitive_labels, default_video=""):
@@ -37,7 +40,7 @@ class DetectionControlPanel:
         
         # 遮蔽参数
         self._blur_kernel = tk.IntVar(value=31)
-        self._pixel_size = tk.IntVar(value=10)
+        self._pixel_size = tk.IntVar(value=13)
         self._distortion_strength = tk.IntVar(value=15)
         self._buffer_frames = tk.IntVar(value=5)  
         
@@ -119,14 +122,18 @@ class DetectionControlPanel:
         self.pixel_frame = ttk.Frame(self.params_frame)
         ttk.Label(self.pixel_frame, text="像素块大小:").pack(side=tk.LEFT)
         ttk.Scale(self.pixel_frame, from_=2, to=50, variable=self._pixel_size, 
-                 orient=tk.HORIZONTAL, length=200).pack(side=tk.LEFT, padx=5)
+                 orient=tk.HORIZONTAL, length=200,
+                 command=lambda v: self._pixel_size.set(int(float(v)))  # 强制取整
+                 ).pack(side=tk.LEFT, padx=5)
         ttk.Label(self.pixel_frame, textvariable=self._pixel_size).pack(side=tk.LEFT)
 
         # 失真参数
         self.distortion_frame = ttk.Frame(self.params_frame)
         ttk.Label(self.distortion_frame, text="扭曲强度:").pack(side=tk.LEFT)
         ttk.Scale(self.distortion_frame, from_=5, to=50, variable=self._distortion_strength, 
-                 orient=tk.HORIZONTAL, length=200).pack(side=tk.LEFT, padx=5)
+                 orient=tk.HORIZONTAL, length=200,
+                 command=lambda v: self._distortion_strength.set(int(float(v)))  # 强制取整
+                 ).pack(side=tk.LEFT, padx=5)
         ttk.Label(self.distortion_frame, textvariable=self._distortion_strength).pack(side=tk.LEFT)
 
         # 缓冲帧数（始终显示，所有模式通用）
@@ -423,10 +430,27 @@ class CensorEffects:
 
 
 class RealtimeCascadeDetector:
-    def __init__(self, fast_model='models/yolo26n.engine', precise_model='models/nudenet_640m.engine'):
-        self.fast_model = YOLO(fast_model, task='detect')
-        self.precise_model = YOLO(precise_model, task='detect')
-
+    def __init__(self, fast_model=None, precise_model=None):
+        if platform.system() == 'Darwin':  # macOS
+            self.device = 'mps'
+            self.fast_model = YOLO(
+                fast_model or 'models/yolo26n.mlpackage', 
+                task='detect'
+            )
+            self.precise_model = YOLO(
+                precise_model or 'models/nudenet_640m.mlpackage', 
+                task='detect'
+            )
+        else:  # Windows
+            self.device = 'cuda'
+            self.fast_model = YOLO(
+                fast_model or 'models/yolo26n.engine', 
+                task='detect'
+            )
+            self.precise_model = YOLO(
+                precise_model or 'models/nudenet_640m.engine', 
+                task='detect'
+            )
         # NudeNet 标签映射
         self.nudenet_labels = [
             "FEMALE_GENITALIA_COVERED", "FACE_FEMALE", "BUTTOCKS_EXPOSED",
@@ -757,14 +781,12 @@ class RealtimeCascadeDetector:
         if self.control_panel is not None:
             self.control_panel.close()
         print("处理完成")
-        if self.control_panel is not None:
-            self.control_panel.close()
-        print("处理完成")
 
 
 if __name__ == "__main__":
-    detector = RealtimeCascadeDetector(
-        fast_model='models/yolo26n.engine',
-        precise_model='models/nudenet_640m.engine'
-    )
-    detector.run()  # 不需要传参了，全部从 GUI 获取
+    detector = RealtimeCascadeDetector()  # 自动按平台选模型
+#     detector = RealtimeCascadeDetector(
+#     fast_model='models/yolo26n.mlpackage',
+#     precise_model='models/nudenet_640m.mlpackage'
+# )
+    detector.run()
