@@ -418,13 +418,67 @@ class RealtimeCascadeDetector:
         if 0 <= class_id < len(self.nudenet_labels):
             return self.nudenet_labels[class_id]
         return f"UNKNOWN_{class_id}"
+    
+    def _merge_breast_boxes(self, breast_detections):
+        """
+        合并同一帧内的 breast 检测框
+        如果只有 1 个，直接返回；如果有多个，合并为最小外接矩形
+        """
+        if len(breast_detections) == 0:
+            return []
+        
+        if len(breast_detections) == 1:
+            return breast_detections
+        
+        # 多个 breast 框：计算最小外接矩形
+        min_x = min(det['bbox'][0] for det in breast_detections)
+        min_y = min(det['bbox'][1] for det in breast_detections)
+        max_x = max(det['bbox'][2] for det in breast_detections)
+        max_y = max(det['bbox'][3] for det in breast_detections)
+        
+        # 取最高置信度作为合并后的置信度
+        max_conf = max(det['confidence'] for det in breast_detections)
+        
+        # 判断是否为敏感类别（有任何一个 exposed 就算敏感）
+        is_sensitive = any(det['is_sensitive'] for det in breast_detections)
+        class_name = "FEMALE_BREAST_EXPOSED" if is_sensitive else "FEMALE_BREAST_COVERED"
+        
+        merged = {
+            'bbox': (min_x, min_y, max_x, max_y),
+            'class': breast_detections[0]['class'],  # 保持原类别 ID
+            'class_name': class_name,
+            'confidence': max_conf,
+            'is_sensitive': is_sensitive
+        }
+        
+        return [merged]
 
     def draw_results(self, frame, detections):
-        """根据 GUI 选择对检测区域进行遮蔽"""
+        """根据 GUI 选择对检测区域进行遮蔽，合并同 ROI 内的 breast 框"""
         mode = self.control_panel.get_censor_mode()
         params = self.control_panel.get_censor_params()
 
+        # 第一步：找出所有 breast 相关的框，进行合并
+        breast_labels = ["FEMALE_BREAST_EXPOSED", "FEMALE_BREAST_COVERED","MALE_BREAST_EXPOSED"]
+        
+        # 分离 breast 和其他检测
+        breast_detections = []
+        other_detections = []
+        
         for det in detections:
+            if det['class_name'] in breast_labels:
+                breast_detections.append(det)
+            else:
+                other_detections.append(det)
+        
+        # 合并 breast 框（如果同一 ROI 有多个）
+        merged_breast = self._merge_breast_boxes(breast_detections)
+        
+        # 合并所有需要处理的检测
+        all_processed = merged_breast + other_detections
+
+        # 第二步：对所有检测进行遮蔽
+        for det in all_processed:
             # 检查是否需要处理
             if self.control_panel is not None and not self.control_panel.should_draw(det['class_name']):
                 continue
