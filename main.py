@@ -6,17 +6,19 @@ import os
 import numpy as np
 
 class DetectionControlPanel:
-    def __init__(self, nudenet_labels, sensitive_labels, default_video=""):
+    def __init__(self, nudenet_labels, sensitive_labels, female_sensitive_labels, default_video=""):
         """
         GUI 控制面板：选择遮蔽方式和要处理的类别
 
         Args:
             nudenet_labels: 所有标签列表
             sensitive_labels: 敏感标签列表
+            female_sensitive_labels: 女性
             default_video: 默认视频路径（可选）
         """
         self.nudenet_labels = nudenet_labels
         self.sensitive_labels = sensitive_labels
+        self.female_sensitive_labels = female_sensitive_labels
 
         # 创建根窗口
         self.root = tk.Tk()
@@ -132,6 +134,7 @@ class DetectionControlPanel:
         ttk.Button(btn_frame, text="全选", command=self._select_all).pack(side=tk.LEFT, padx=(0, 5))
         ttk.Button(btn_frame, text="取消全选", command=self._deselect_all).pack(side=tk.LEFT)
         ttk.Button(btn_frame, text="仅选敏感", command=self._select_sensitive_only).pack(side=tk.LEFT, padx=(5, 0))
+        ttk.Button(btn_frame, text="仅选女性", command=self._select_female_only).pack(side=tk.LEFT, padx=(10, 0))
 
         # 画布+滚动条
         canvas = tk.Canvas(class_frame, height=300)
@@ -212,6 +215,10 @@ class DetectionControlPanel:
         """仅选择敏感类别"""
         for label, var in self._label_vars.items():
             var.set(label in self.sensitive_labels)
+    def _select_female_only(self):
+        """仅选择敏感类别"""
+        for label, var in self._label_vars.items():
+            var.set(label in self.female_sensitive_labels)
 
     # ========== 原有方法不变 ==========
 
@@ -398,6 +405,12 @@ class RealtimeCascadeDetector:
             "FEMALE_GENITALIA_EXPOSED", "MALE_BREAST_EXPOSED",
             "ANUS_EXPOSED", "MALE_GENITALIA_EXPOSED",
         ]
+        self.female_sensitive_labels = [
+            "FEMALE_GENITALIA_COVERED", "FACE_FEMALE", "BUTTOCKS_EXPOSED",
+            "FEMALE_BREAST_EXPOSED", "FEMALE_GENITALIA_EXPOSED", "ANUS_EXPOSED",
+            "ANUS_COVERED",
+            "FEMALE_BREAST_COVERED", "BUTTOCKS_COVERED",
+        ]
         # 新增：控制面板（延迟初始化，避免影响模型加载）
         self.control_panel = None
 
@@ -441,6 +454,7 @@ class RealtimeCascadeDetector:
         self.control_panel = DetectionControlPanel(
             nudenet_labels=self.nudenet_labels,
             sensitive_labels=self.sensitive_labels,
+            female_sensitive_labels = self.female_sensitive_labels,
             default_video="./test/【兰幼金】夏日辣妹Bubble Pop❤超元气可爱小马达！ P1 横屏   - 0.00.13-0.00.23.mp4"  # 可选默认值
         )
 
@@ -522,7 +536,8 @@ class RealtimeCascadeDetector:
                         'class': cls,
                         'class_name': label_name,
                         'confidence': conf,
-                        'is_sensitive': label_name in self.sensitive_labels
+                        'is_sensitive': label_name in self.sensitive_labels,
+                        'is_female': label_name in self.female_sensitive_labels
                     })
 
                 # 调试保存（带检测框的 ROI）
