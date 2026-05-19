@@ -403,7 +403,12 @@ class DetectionControlPanel:
         if not self._running:
             return False
         if class_name in self._label_vars:
-            return self._label_vars[class_name].get()
+            enabled = self._label_vars[class_name].get()
+            if class_name in ("FACE_FEMALE", "FACE_MALE") and enabled:
+                eye_enabled = self._label_vars.get("eye", None)
+                if eye_enabled and eye_enabled.get():
+                    return False
+            return enabled
         return True
 
     # ========== Getter 方法 ==========
@@ -563,12 +568,14 @@ class RealtimeCascadeDetector:
             self.precise_model = YOLO(
                 precise_model or "models/nudenet_640m.mlpackage", task="detect"
             )
+            self.eye_model = YOLO("models/face-parts-yolov8n.mlpackage", task="detect")
         else:  # Windows
             self.device = "cuda"
             self.fast_model = YOLO(fast_model or "models/yolo26n.engine", task="detect")
             self.precise_model = YOLO(
                 precise_model or "models/nudenet_640m.engine", task="detect"
             )
+            self.eye_model = YOLO("models/face-parts-yolov8n.engine", task="detect")
         # NudeNet 标签映射
         self.nudenet_labels = [
             "FEMALE_GENITALIA_COVERED",
@@ -589,6 +596,7 @@ class RealtimeCascadeDetector:
             "ANUS_COVERED",
             "FEMALE_BREAST_COVERED",
             "BUTTOCKS_COVERED",
+            "eye",
         ]
         self.sensitive_labels = [
             "BUTTOCKS_EXPOSED",
@@ -597,6 +605,7 @@ class RealtimeCascadeDetector:
             "MALE_BREAST_EXPOSED",
             "ANUS_EXPOSED",
             "MALE_GENITALIA_EXPOSED",
+            "eye",
         ]
         self.female_sensitive_labels = [
             "FEMALE_GENITALIA_COVERED",
@@ -608,6 +617,7 @@ class RealtimeCascadeDetector:
             "ANUS_COVERED",
             "FEMALE_BREAST_COVERED",
             "BUTTOCKS_COVERED",
+            "eye",
         ]
         # 新增：控制面板（延迟初始化，避免影响模型加载）
         self.control_panel = None
@@ -669,31 +679,94 @@ class RealtimeCascadeDetector:
 
         return [merged]
 
+    def _merge_eye_boxes(self, eye_detections):
+        """
+        合并同一张脸上的 eye 检测框
+        eye_detections 是同一 face_idx 的眼睛列表
+        """
+        eye_padding_x_ratio = 0.3
+        eye_padding_y_ratio = 0.15
+        if len(eye_detections) == 0:
+            return []
+        if len(eye_detections) == 1:
+            det = eye_detections[0]
+            x1, y1, x2, y2 = det["bbox"]
+            width = x2 - x1
+            height = y2 - y1
+            # 使用比例：x方向扩展宽度的0.2倍，y方向扩展高度的0.1倍
+            padding_x = int(width * eye_padding_x_ratio)
+            padding_y = int(height * eye_padding_y_ratio)
+            merged = {
+                "bbox": (x1 - padding_x, y1 - padding_y, x2 + padding_x, y2 + padding_y),
+                "class": 999,
+                "class_name": "eye",
+                "confidence": det["confidence"],
+                "is_sensitive": True,
+                "is_female": False,
+            }
+            return [merged]
+
+        min_x = min(det["bbox"][0] for det in eye_detections)
+        min_y = min(det["bbox"][1] for det in eye_detections)
+        max_x = max(det["bbox"][2] for det in eye_detections)
+        max_y = max(det["bbox"][3] for det in eye_detections)
+        max_conf = max(det["confidence"] for det in eye_detections)
+        
+        # 计算合并框的宽高
+        width = max_x - min_x
+        height = max_y - min_y
+        # 使用比例计算padding
+        padding_x = int(width * eye_padding_x_ratio)
+        padding_y = int(height * eye_padding_y_ratio)
+
+        merged = {
+            "bbox": (min_x - padding_x, min_y - padding_y, max_x + padding_x, max_y + padding_y),
+            "class": 999,
+            "class_name": "eye",
+            "confidence": max_conf,
+            "is_sensitive": True,
+            "is_female": False,
+        }
+        return [merged]
+
     def draw_results(self, frame, detections):
         """根据 GUI 选择对检测区域进行遮蔽，合并同 ROI 内的 breast 框"""
         mode = self.control_panel.get_censor_mode()
         params = self.control_panel.get_censor_params()
         buffer_frames = self.control_panel.get_buffer_frames()
 
-        # 第一步：找出所有 breast 相关的框，进行合并
         breast_labels = [
             "FEMALE_BREAST_EXPOSED",
             "FEMALE_BREAST_COVERED",
             "MALE_BREAST_EXPOSED",
         ]
 
-        # 分离 breast 和其他检测
         breast_detections = []
+        eye_detections = []
         other_detections = []
 
         for det in detections:
             if det["class_name"] in breast_labels:
                 breast_detections.append(det)
+            elif det["class_name"] == "eye" and "face_idx" in det:
+                eye_detections.append(det)
             else:
                 other_detections.append(det)
 
         merged_breast = self._merge_breast_boxes(breast_detections)
-        current_detections = merged_breast + other_detections
+
+        face_eye_map = {}
+        for eye_det in eye_detections:
+            face_idx = eye_det.pop("face_idx")
+            if face_idx not in face_eye_map:
+                face_eye_map[face_idx] = []
+            face_eye_map[face_idx].append(eye_det)
+
+        merged_eyes = []
+        for face_idx, eyes in face_eye_map.items():
+            merged_eyes.extend(self._merge_eye_boxes(eyes))
+
+        current_detections = merged_breast + merged_eyes + other_detections
 
         # ========== 更新缓冲区 ==========
         if buffer_frames > 0:
@@ -916,6 +989,8 @@ class RealtimeCascadeDetector:
 
             # ----------------- 第二阶段：NudeNet 检测 -----------------
             final_detections = []
+            face_rois = []
+            face_count = 0
             for idx, (x1, y1, x2, y2) in enumerate(candidates):
                 roi = frame[y1:y2, x1:x2]
                 if roi.size == 0:
@@ -939,6 +1014,12 @@ class RealtimeCascadeDetector:
                             "is_female": label_name in self.female_sensitive_labels,
                         }
                     )
+
+                    if label_name in ("FACE_FEMALE", "FACE_MALE"):
+                        face_rois.append(
+                            (face_count, x1 + rx1, y1 + ry1, x1 + rx2, y1 + ry2)
+                        )
+                        face_count += 1
 
                 # 调试保存（带检测框的 ROI）
                 if frame_id % 30 == 0:
@@ -968,6 +1049,35 @@ class RealtimeCascadeDetector:
                             )
                     cv2.imwrite(
                         f"./debug_roi/debug_roi_{frame_id}_{idx}.jpg", roi_annotated
+                    )
+
+            # ----------------- 第三阶段：Eye 模型检测 -----------------
+            for face_idx, fx1, fy1, fx2, fy2 in face_rois:
+                face_roi = frame[fy1:fy2, fx1:fx2]
+                if face_roi.size == 0:
+                    continue
+                eye_results = self.eye_model(face_roi, conf=0.25, imgsz=320)
+                for er in eye_results[0].boxes:
+                    cls_id = int(er.cls[0])
+                    label_name = self.eye_model.names[cls_id]
+                    if label_name != "eye":
+                        continue
+                    er_x1, er_y1, er_x2, er_y2 = map(int, er.xyxy[0].tolist())
+                    final_detections.append(
+                        {
+                            "bbox": (
+                                fx1 + er_x1,
+                                fy1 + er_y1,
+                                fx1 + er_x2,
+                                fy1 + er_y2,
+                            ),
+                            "class": 999,
+                            "class_name": "eye",
+                            "confidence": float(er.conf[0]),
+                            "is_sensitive": True,
+                            "is_female": True,
+                            "face_idx": face_idx,
+                        }
                     )
 
             # 绘制并写入 ffmpeg 管道
