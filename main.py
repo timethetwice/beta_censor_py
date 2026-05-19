@@ -300,15 +300,24 @@ class DetectionControlPanel:
 
     def _browse_output(self):
         """选择输出路径"""
-        filetypes = (("MP4 视频", "*.mp4"), ("所有文件", "*.*"))
-        filename = filedialog.asksaveasfilename(
-            title="保存输出视频",
-            filetypes=filetypes,
-            defaultextension=".mp4",
-            initialdir=".",
-        )
-        if filename:
-            self._output_path.set(filename)
+        current_output = self._output_path.get().strip()
+        if os.path.isdir(current_output):
+            folder = filedialog.askdirectory(
+                title="选择输出文件夹",
+                initialdir=current_output,
+            )
+            if folder:
+                self._output_path.set(folder)
+        else:
+            filetypes = (("MP4 视频", "*.mp4"), ("所有文件", "*.*"))
+            filename = filedialog.asksaveasfilename(
+                title="保存输出视频",
+                filetypes=filetypes,
+                defaultextension=".mp4",
+                initialdir=current_output if os.path.isdir(current_output) else ".",
+            )
+            if filename:
+                self._output_path.set(filename)
 
     def _use_camera(self):
         """使用摄像头"""
@@ -748,22 +757,31 @@ class RealtimeCascadeDetector:
         for det in detections:
             if det["class_name"] in breast_labels:
                 breast_detections.append(det)
-            elif det["class_name"] == "eye" and "face_idx" in det:
+            elif det["class_name"] == "eye":
                 eye_detections.append(det)
             else:
                 other_detections.append(det)
 
-        merged_breast = self._merge_breast_boxes(breast_detections)
+        person_breast_map = {}
+        for det in breast_detections:
+            pid = det.pop("person_idx", None)
+            if pid not in person_breast_map:
+                person_breast_map[pid] = []
+            person_breast_map[pid].append(det)
 
-        face_eye_map = {}
-        for eye_det in eye_detections:
-            face_idx = eye_det.pop("face_idx")
-            if face_idx not in face_eye_map:
-                face_eye_map[face_idx] = []
-            face_eye_map[face_idx].append(eye_det)
+        person_eye_map = {}
+        for det in eye_detections:
+            pid = det.pop("person_idx", None)
+            if pid not in person_eye_map:
+                person_eye_map[pid] = []
+            person_eye_map[pid].append(det)
+
+        merged_breast = []
+        for pid, breasts in person_breast_map.items():
+            merged_breast.extend(self._merge_breast_boxes(breasts))
 
         merged_eyes = []
-        for face_idx, eyes in face_eye_map.items():
+        for pid, eyes in person_eye_map.items():
             merged_eyes.extend(self._merge_eye_boxes(eyes))
 
         current_detections = merged_breast + merged_eyes + other_detections
@@ -989,8 +1007,7 @@ class RealtimeCascadeDetector:
 
             # ----------------- 第二阶段：NudeNet 检测 -----------------
             final_detections = []
-            face_rois = []
-            face_count = 0
+            face_rois = {}
             for idx, (x1, y1, x2, y2) in enumerate(candidates):
                 roi = frame[y1:y2, x1:x2]
                 if roi.size == 0:
@@ -1012,14 +1029,12 @@ class RealtimeCascadeDetector:
                             "confidence": conf,
                             "is_sensitive": label_name in self.sensitive_labels,
                             "is_female": label_name in self.female_sensitive_labels,
+                            "person_idx": idx,
                         }
                     )
 
                     if label_name in ("FACE_FEMALE", "FACE_MALE"):
-                        face_rois.append(
-                            (face_count, x1 + rx1, y1 + ry1, x1 + rx2, y1 + ry2)
-                        )
-                        face_count += 1
+                        face_rois[idx] = (x1 + rx1, y1 + ry1, x1 + rx2, y1 + ry2)
 
                 # 调试保存（带检测框的 ROI）
                 if frame_id % 30 == 0:
@@ -1052,7 +1067,7 @@ class RealtimeCascadeDetector:
                     )
 
             # ----------------- 第三阶段：Eye 模型检测 -----------------
-            for face_idx, fx1, fy1, fx2, fy2 in face_rois:
+            for person_idx, (fx1, fy1, fx2, fy2) in face_rois.items():
                 face_roi = frame[fy1:fy2, fx1:fx2]
                 if face_roi.size == 0:
                     continue
@@ -1076,7 +1091,7 @@ class RealtimeCascadeDetector:
                             "confidence": float(er.conf[0]),
                             "is_sensitive": True,
                             "is_female": True,
-                            "face_idx": face_idx,
+                            "person_idx": person_idx,
                         }
                     )
 
@@ -1196,14 +1211,10 @@ class RealtimeCascadeDetector:
                 success = True
             else:
                 # 多文件或文件夹
+                output_dir = output_base if os.path.isdir(output_base) else "."
                 for i, video_source in enumerate(video_sources):
-                    dir_name = (
-                        os.path.dirname(video_source)
-                        if os.path.dirname(video_source)
-                        else "."
-                    )
                     base_name = os.path.splitext(os.path.basename(video_source))[0]
-                    output_path = os.path.join(dir_name, f"{base_name}_censored.mp4")
+                    output_path = os.path.join(output_dir, f"{base_name}_censored.mp4")
 
                     if i > 0 and preview:
                         cv2.destroyAllWindows()
