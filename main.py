@@ -8,191 +8,176 @@ import subprocess
 import platform
 
 
+import tkinter as tk
+from tkinter import ttk, filedialog
+import os
+import cv2
 
 class DetectionControlPanel:
     def __init__(self, nudenet_labels, sensitive_labels, female_sensitive_labels, default_video=""):
-        """
-        GUI 控制面板：选择遮蔽方式和要处理的类别
-
-        Args:
-            nudenet_labels: 所有标签列表
-            sensitive_labels: 敏感标签列表
-            female_sensitive_labels: 女性
-            default_video: 默认视频路径（可选）
-        """
         self.nudenet_labels = nudenet_labels
         self.sensitive_labels = sensitive_labels
         self.female_sensitive_labels = female_sensitive_labels
 
-        # 创建根窗口
         self.root = tk.Tk()
         self.root.title("检测控制面板")
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self._running = True
         self._started = False
 
-        # 视频路径 - 支持多文件
-        self._video_paths = []  # 文件列表
+        # ⬇️ 设置窗口大小，确保标签页可见
+        self.root.geometry("500x600")
+        self.root.minsize(450, 500)
+
+        # 视频路径
+        self._video_paths = []
         self._video_path = tk.StringVar(value=default_video)
         self._output_path = tk.StringVar(value="output_censored.mp4")
+        self._target_size_mb = tk.DoubleVar(value=0)
 
         # 遮蔽方式
         self._censor_mode = tk.StringVar(value="black")
-        
-        # 遮蔽参数
         self._blur_kernel = tk.IntVar(value=81)
         self._pixel_size = tk.IntVar(value=13)
         self._distortion_strength = tk.IntVar(value=15)
-        self._buffer_frames = tk.IntVar(value=5)  
-        
+        self._buffer_frames = tk.IntVar(value=5)
+
         # 标签选择
         self._label_vars = {}
 
+        # ⬇️ 先构建 UI
         self._build_ui()
 
     def _build_ui(self):
-        main_frame = ttk.Frame(self.root, padding=10)
-        main_frame.pack(fill=tk.BOTH, expand=True)
+        outer_frame = ttk.Frame(self.root, padding=10)
+        outer_frame.pack(fill=tk.BOTH, expand=True)
 
-        # ========== 视频文件选择 ==========
-        video_frame = ttk.LabelFrame(main_frame, text="视频设置", padding=10)
-        video_frame.pack(fill=tk.X, pady=(0, 10))
+        notebook = ttk.Notebook(outer_frame)
+        notebook.pack(fill=tk.BOTH, expand=True)
 
+        tab_video = ttk.Frame(notebook, padding=10)
+        notebook.add(tab_video, text="视频设置")
+        self._build_video_tab(tab_video)
+
+        tab_censor = ttk.Frame(notebook, padding=10)
+        notebook.add(tab_censor, text="遮蔽方式")
+        self._build_censor_tab(tab_censor)
+
+        tab_class = ttk.Frame(notebook, padding=10)
+        notebook.add(tab_class, text="类别选择")
+        self._build_class_tab(tab_class)
+
+        bottom_frame = ttk.Frame(outer_frame)
+        bottom_frame.pack(fill=tk.X, pady=(10, 0))
+        self.start_btn = ttk.Button(bottom_frame, text="▶  开始检测", command=self._on_start)
+        self.start_btn.pack(pady=5)
+        self.status_label = ttk.Label(bottom_frame, 
+                                      text="请选择视频文件、遮蔽方式和要处理的类别后点击开始", 
+                                      foreground="gray")
+        self.status_label.pack()
+
+    def _build_video_tab(self, parent):
         # 输入视频
-        input_row = ttk.Frame(video_frame)
+        input_row = ttk.Frame(parent)
         input_row.pack(fill=tk.X, pady=(0, 5))
         ttk.Label(input_row, text="输入视频:", width=10).pack(side=tk.LEFT)
-        
         self.video_entry = ttk.Entry(input_row, textvariable=self._video_path)
         self.video_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
-        
-        ttk.Button(input_row, text="浏览...", command=self._browse_video).pack(side=tk.RIGHT)
-        ttk.Button(input_row, text="摄像头", command=self._use_camera).pack(side=tk.RIGHT, padx=(0, 10))
+        ttk.Button(input_row, text="文件...", command=self._browse_video).pack(side=tk.RIGHT)
+        ttk.Button(input_row, text="文件夹...", command=self._browse_folder).pack(side=tk.RIGHT, padx=(0, 5))
+        ttk.Button(input_row, text="摄像头", command=self._use_camera).pack(side=tk.RIGHT, padx=(0, 5))
 
         # 输出视频
-        output_row = ttk.Frame(video_frame)
-        output_row.pack(fill=tk.X)
+        output_row = ttk.Frame(parent)
+        output_row.pack(fill=tk.X, pady=(0, 5))
         ttk.Label(output_row, text="输出视频:", width=10).pack(side=tk.LEFT)
-        
         self.output_entry = ttk.Entry(output_row, textvariable=self._output_path)
         self.output_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
-        
         ttk.Button(output_row, text="浏览...", command=self._browse_output).pack(side=tk.RIGHT)
 
-        ttk.Separator(main_frame).pack(fill=tk.X, pady=10)
+        # 目标码率
+        size_row = ttk.Frame(parent)
+        size_row.pack(fill=tk.X)
+        ttk.Label(size_row, text="目标码率:", width=10).pack(side=tk.LEFT)
+        self.size_entry = ttk.Entry(size_row, textvariable=self._target_size_mb, width=10)
+        self.size_entry.pack(side=tk.LEFT, padx=(0, 3))
+        ttk.Label(size_row, text="MB (0=不限制)").pack(side=tk.LEFT)
 
         # 预览开关
-        preview_row = ttk.Frame(video_frame)
-        preview_row.pack(fill=tk.X, pady=(5, 0))
         self._show_preview = tk.BooleanVar(value=True)
-        ttk.Checkbutton(preview_row, text="显示预览窗口（关闭可加速）", 
-                        variable=self._show_preview).pack(side=tk.LEFT)
+        ttk.Checkbutton(parent, text="显示预览窗口（关闭可加速）", 
+                       variable=self._show_preview).pack(anchor='w', pady=(10, 0))
 
-        # ========== 遮蔽方式选择 ==========
-        mode_frame = ttk.LabelFrame(main_frame, text="遮蔽方式", padding=10)
-        mode_frame.pack(fill=tk.X, pady=(0, 10))
-
-        modes = [
-            ("黑块遮蔽", "black"),
-            ("高斯模糊", "blur"),
-            ("像素化", "pixelate"),
-            ("失真效果", "distortion"),
-        ]
-        
-        # 使用两行两列布局
-        mode_grid = ttk.Frame(mode_frame)
+    def _build_censor_tab(self, parent):
+        # 遮蔽方式选择
+        modes = [("黑块遮蔽", "black"), ("高斯模糊", "blur"), 
+                ("像素化", "pixelate"), ("失真效果", "distortion")]
+        mode_grid = ttk.Frame(parent)
         mode_grid.pack()
         for i, (text, value) in enumerate(modes):
             row, col = i // 2, i % 2
             ttk.Radiobutton(mode_grid, text=text, variable=self._censor_mode, 
-                          value=value, command=self._on_mode_change).grid(row=row, column=col, 
-                                                                          sticky='w', padx=20, pady=3)
+                          value=value, command=self._on_mode_change).grid(
+                          row=row, column=col, sticky='w', padx=20, pady=3)
 
-        # 参数调节区
-        self.params_frame = ttk.LabelFrame(mode_frame, text="参数调节", padding=5)
+        # 参数调节
+        self.params_frame = ttk.LabelFrame(parent, text="参数调节", padding=5)
         self.params_frame.pack(fill=tk.X, pady=(10, 0))
 
         # 高斯模糊参数
         self.blur_frame = ttk.Frame(self.params_frame)
         ttk.Label(self.blur_frame, text="模糊核大小 (奇数):").pack(side=tk.LEFT)
-        ttk.Scale(
-            self.blur_frame, 
-            from_=5, 
-            to=99, 
-            variable=self._blur_kernel, 
-            orient=tk.HORIZONTAL, 
-            length=200,
-            command=lambda v: self._blur_kernel.set(int(float(v)) | 1)  # 强制奇数
-        ).pack(side=tk.LEFT, padx=5)
+        ttk.Scale(self.blur_frame, from_=5, to=99, variable=self._blur_kernel, 
+                 orient=tk.HORIZONTAL, length=200, 
+                 command=lambda v: self._blur_kernel.set(int(float(v)) | 1)).pack(side=tk.LEFT, padx=5)
         ttk.Label(self.blur_frame, textvariable=self._blur_kernel).pack(side=tk.LEFT)
 
         # 像素化参数
         self.pixel_frame = ttk.Frame(self.params_frame)
-        ttk.Label(self.pixel_frame, text="像素块大小:").pack(side=tk.LEFT)
-        ttk.Scale(self.pixel_frame, from_=2, to=50, variable=self._pixel_size, 
-                 orient=tk.HORIZONTAL, length=200,
-                 command=lambda v: self._pixel_size.set(int(float(v)))  # 强制取整
-                 ).pack(side=tk.LEFT, padx=5)
+        ttk.Label(self.pixel_frame, text="像素块数量:").pack(side=tk.LEFT)
+        ttk.Scale(self.pixel_frame, from_=5, to=50, variable=self._pixel_size, 
+                 orient=tk.HORIZONTAL, length=200, 
+                 command=lambda v: self._pixel_size.set(int(float(v)))).pack(side=tk.LEFT, padx=5)
         ttk.Label(self.pixel_frame, textvariable=self._pixel_size).pack(side=tk.LEFT)
 
         # 失真参数
         self.distortion_frame = ttk.Frame(self.params_frame)
         ttk.Label(self.distortion_frame, text="扭曲强度:").pack(side=tk.LEFT)
         ttk.Scale(self.distortion_frame, from_=5, to=50, variable=self._distortion_strength, 
-                 orient=tk.HORIZONTAL, length=200,
-                 command=lambda v: self._distortion_strength.set(int(float(v)))  # 强制取整
-                 ).pack(side=tk.LEFT, padx=5)
+                 orient=tk.HORIZONTAL, length=200, 
+                 command=lambda v: self._distortion_strength.set(int(float(v)))).pack(side=tk.LEFT, padx=5)
         ttk.Label(self.distortion_frame, textvariable=self._distortion_strength).pack(side=tk.LEFT)
 
-        # 缓冲帧数（始终显示，所有模式通用）
+        # 缓冲帧数（始终显示）
         self.buffer_frame = ttk.Frame(self.params_frame)
         ttk.Label(self.buffer_frame, text="缓冲帧数:").pack(side=tk.LEFT)
-        ttk.Scale(
-            self.buffer_frame, 
-            from_=0, 
-            to=30, 
-            variable=self._buffer_frames, 
-            orient=tk.HORIZONTAL, 
-            length=200,
-            command=lambda v: self._buffer_frames.set(int(float(v)))  # 强制取整
-        ).pack(side=tk.LEFT, padx=5)
+        ttk.Scale(self.buffer_frame, from_=0, to=30, variable=self._buffer_frames, 
+                 orient=tk.HORIZONTAL, length=200, 
+                 command=lambda v: self._buffer_frames.set(int(float(v)))).pack(side=tk.LEFT, padx=5)
         ttk.Label(self.buffer_frame, textvariable=self._buffer_frames).pack(side=tk.LEFT)
 
-        # 初始显示缓冲帧数
         self.buffer_frame.pack(fill=tk.X, pady=5)
-
         self._on_mode_change()
 
-        ttk.Separator(main_frame).pack(fill=tk.X, pady=10)
-
-        # ========== 类别选择 ==========
-        class_frame = ttk.LabelFrame(main_frame, text="选择要遮蔽的类别", padding=5)
-        class_frame.pack(fill=tk.BOTH, expand=True)
-
-        # 全选/取消全选按钮
-        btn_frame = ttk.Frame(class_frame)
+    def _build_class_tab(self, parent):
+        # 按钮
+        btn_frame = ttk.Frame(parent)
         btn_frame.pack(fill=tk.X, pady=(0, 5))
         ttk.Button(btn_frame, text="全选", command=self._select_all).pack(side=tk.LEFT, padx=(0, 5))
         ttk.Button(btn_frame, text="取消全选", command=self._deselect_all).pack(side=tk.LEFT)
         ttk.Button(btn_frame, text="仅选敏感", command=self._select_sensitive_only).pack(side=tk.LEFT, padx=(5, 0))
         ttk.Button(btn_frame, text="仅选女性", command=self._select_female_only).pack(side=tk.LEFT, padx=(10, 0))
 
-        # 画布+滚动条
-        canvas = tk.Canvas(class_frame, height=300)
-        scrollbar = ttk.Scrollbar(class_frame, orient=tk.VERTICAL, command=canvas.yview)
+        # 滚动类别列表
+        canvas = tk.Canvas(parent, height=250)
+        scrollbar = ttk.Scrollbar(parent, orient=tk.VERTICAL, command=canvas.yview)
         scrollable_frame = ttk.Frame(canvas)
-
-        scrollable_frame.bind(
-            "<Configure>",
-            lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-        )
+        scrollable_frame.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
         canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
         canvas.configure(yscrollcommand=scrollbar.set)
-
         canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
 
-        # 为每个标签创建复选框
         self._label_vars = {}
         for label in self.nudenet_labels:
             var = tk.BooleanVar(value=True)
@@ -202,46 +187,45 @@ class DetectionControlPanel:
             cb = ttk.Checkbutton(scrollable_frame, text=display_text, variable=var)
             cb.pack(anchor='w', pady=1)
 
-        ttk.Separator(main_frame).pack(fill=tk.X, pady=10)
+    # ========== 文件浏览方法 ==========
 
-        # 开始按钮
-        self.start_btn = ttk.Button(main_frame, text="▶  开始检测", command=self._on_start)
-        self.start_btn.pack(pady=5)
-
-        # 状态标签
-        self.status_label = ttk.Label(main_frame, text="请选择视频文件、遮蔽方式和要处理的类别后点击开始", foreground="gray")
-        self.status_label.pack()
-
-    # ========== 新增方法 ==========
-    
     def _browse_video(self):
-        """浏览选择视频文件（自动判断文件或文件夹）"""
-        initial = self._output_path.get().strip() or "."
-        selection = filedialog.askopenfilename(title="选择视频文件或文件夹", initialdir=initial)
-        if not selection:
-            return
-        
-        if os.path.isdir(selection):
-            self._video_paths = []
-            for f in sorted(os.listdir(selection)):
-                if f.lower().endswith(('.mp4', '.avi', '.mov', '.mkv', '.flv', '.wmv')):
-                    self._video_paths.append(os.path.join(selection, f))
-            count = len(self._video_paths)
-            self._video_path.set(f"📁 {count} 个视频" if count else "📁 空文件夹")
-            self._output_path.set(selection)
-        else:
-            self._video_path.set(selection)
-            self._video_paths = [selection]
-            dir_name = os.path.dirname(selection)
-            base_name = os.path.splitext(os.path.basename(selection))[0]
-            self._output_path.set(os.path.join(dir_name, f"{base_name}_censored.mp4"))
-
-    def _browse_output(self):
-        """浏览选择输出路径"""
+        """选择单个视频文件"""
         filetypes = (
-            ("MP4 视频", "*.mp4"),
+            ("视频文件", "*.mp4 *.avi *.mov *.mkv *.flv *.wmv"),
             ("所有文件", "*.*")
         )
+        filename = filedialog.askopenfilename(
+            title="选择视频文件",
+            filetypes=filetypes,
+            initialdir="."
+        )
+        if filename:
+            self._video_path.set(filename)
+            self._video_paths = [filename]
+            dir_name = os.path.dirname(filename)
+            base_name = os.path.splitext(os.path.basename(filename))[0]
+            self._output_path.set(os.path.join(dir_name, f"{base_name}_censored.mp4"))
+
+    def _browse_folder(self):
+        """选择文件夹（批量处理）"""
+        folder = filedialog.askdirectory(title="选择包含视频的文件夹", initialdir=".")
+        if folder:
+            video_exts = ('.mp4', '.avi', '.mov', '.mkv', '.flv', '.wmv')
+            self._video_paths = []
+            for f in sorted(os.listdir(folder)):
+                if f.lower().endswith(video_exts):
+                    self._video_paths.append(os.path.join(folder, f))
+            count = len(self._video_paths)
+            if count:
+                self._video_path.set(f"📁 {folder} ({count} 个视频)")
+            else:
+                self._video_path.set(f"📁 {folder} (无视频文件)")
+            self._output_path.set(folder)
+
+    def _browse_output(self):
+        """选择输出路径"""
+        filetypes = (("MP4 视频", "*.mp4"), ("所有文件", "*.*"))
         filename = filedialog.asksaveasfilename(
             title="保存输出视频",
             filetypes=filetypes,
@@ -251,36 +235,20 @@ class DetectionControlPanel:
         if filename:
             self._output_path.set(filename)
 
-                    
-    def get_preview(self):
-        """获取是否显示预览"""
-        return self._show_preview.get()
-
     def _use_camera(self):
         """使用摄像头"""
-        self._video_path.set("摄像头模式")
-        self._video_paths = ["0"]
+        self._video_path.set("0")
+        self._video_paths = [0]
         self._output_path.set("camera_output.mp4")
 
-    def _select_sensitive_only(self):
-        """仅选择敏感类别"""
-        for label, var in self._label_vars.items():
-            var.set(label in self.sensitive_labels)
-    def _select_female_only(self):
-        """仅选择敏感类别"""
-        for label, var in self._label_vars.items():
-            var.set(label in self.female_sensitive_labels)
+    # ========== 模式切换 ==========
 
     def _on_mode_change(self):
-        """遮蔽方式改变时显示对应的参数，缓冲帧数始终显示"""
-        mode = self._censor_mode.get()
-        
-        # 隐藏所有特定模式参数
-        for frame in [self.blur_frame, self.pixel_frame, self.distortion_frame]:
+        """遮蔽方式改变时显示对应参数"""
+        for frame in [self.blur_frame, self.pixel_frame, self.distortion_frame, self.buffer_frame]:
             frame.pack_forget()
-        self.buffer_frame.pack_forget()
         
-        # 显示对应参数
+        mode = self._censor_mode.get()
         if mode == "blur":
             self.blur_frame.pack(fill=tk.X, pady=5)
         elif mode == "pixelate":
@@ -291,10 +259,8 @@ class DetectionControlPanel:
         # 缓冲帧数始终显示
         self.buffer_frame.pack(fill=tk.X, pady=5)
 
-    def get_buffer_frames(self):
-        """获取缓冲帧数"""
-        return self._buffer_frames.get()
-    
+    # ========== 选择方法 ==========
+
     def _select_all(self):
         for var in self._label_vars.values():
             var.set(True)
@@ -303,23 +269,24 @@ class DetectionControlPanel:
         for var in self._label_vars.values():
             var.set(False)
 
-    def _on_start(self):
-        if self._video_path.get() == "摄像头模式":
-            video_paths = ["0"]
-        elif not self._video_paths:
-            self.status_label.configure(text="请先选择视频文件！", foreground="red")
-            return
-        else:
-            video_paths = self._video_paths
+    def _select_sensitive_only(self):
+        for label, var in self._label_vars.items():
+            var.set(label in self.sensitive_labels)
 
+    def _select_female_only(self):
+        for label, var in self._label_vars.items():
+            var.set(label in self.female_sensitive_labels)
+
+    # ========== 开始/状态 ==========
+
+    def _on_start(self):
+        video_path = self._video_path.get().strip()
+        if not video_path or video_path.startswith("📁") and not self._video_paths:
+            self.status_label.configure(text="请先选择有效的视频文件！", foreground="red")
+            return
         self._started = True
         self.start_btn.configure(text="●  检测中...", state="disabled")
-        selected_count = sum(1 for v in self._label_vars.values() if v.get())
-        total = len(video_paths) if video_paths[0] != "0" else 1
-        self.status_label.configure(
-            text=f"已开始 | 视频: {'摄像头' if video_paths[0] == '0' else f'{total}个文件'} | 遮蔽: {self.get_censor_mode_name()} | 选中 {selected_count} 个类别",
-            foreground="green"
-        )
+        self.status_label.configure(text="已开始检测...", foreground="green")
 
     def is_started(self):
         return self._started
@@ -331,17 +298,10 @@ class DetectionControlPanel:
             return self._label_vars[class_name].get()
         return True
 
+    # ========== Getter 方法 ==========
+
     def get_censor_mode(self):
         return self._censor_mode.get()
-
-    def get_censor_mode_name(self):
-        names = {
-            "black": "黑块",
-            "blur": "高斯模糊",
-            "pixelate": "像素化",
-            "distortion": "失真"
-        }
-        return names.get(self._censor_mode.get(), "未知")
 
     def get_censor_params(self):
         mode = self._censor_mode.get()
@@ -353,15 +313,29 @@ class DetectionControlPanel:
             return {"strength": self._distortion_strength.get()}
         return {}
 
+    def get_buffer_frames(self):
+        return self._buffer_frames.get()
+
+    def get_video_paths(self):
+        if self._video_paths:
+            return self._video_paths
+        path = self._video_path.get().strip()
+        if path == "0":
+            return [0]
+        if path and not path.startswith("📁"):
+            return [path]
+        return []
+
     def get_output_path(self):
-        """获取输出路径"""
         return self._output_path.get().strip()
 
-    def get_video_path(self):
-        """获取视频路径列表"""
-        if self._video_path.get() == "摄像头模式":
-            return ["0"]
-        return self._video_paths if self._video_paths else []
+    def get_preview(self):
+        return self._show_preview.get()
+
+    def get_target_size_mb(self):
+        return self._target_size_mb.get()
+
+    # ========== 生命周期 ==========
 
     def update(self):
         if self._running:
@@ -375,7 +349,6 @@ class DetectionControlPanel:
     def close(self):
         self._running = False
         self.root.destroy()
-
 class CensorEffects:
     """遮蔽效果工具类"""
     
@@ -420,16 +393,26 @@ class CensorEffects:
     
     @staticmethod
     def pixelate(frame, x1, y1, x2, y2, pixel_size=10):
-        """像素化遮蔽"""
+        """像素化遮蔽（GUI 参数控制块数）"""
         roi = frame[y1:y2, x1:x2]
         if roi.size == 0:
             return frame
+        
         h, w = roi.shape[:2]
-        # 缩小
-        temp = cv2.resize(roi, (max(1, w // pixel_size), max(1, h // pixel_size)), 
-                         interpolation=cv2.INTER_LINEAR)
-        # 放大
+        
+        # pixel_size 表示目标块数（沿短边），范围建议 5-50
+        blocks = max(3, pixel_size)
+        
+        # 计算实际像素块大小
+        size = max(1, min(h, w) // blocks)
+        
+        # 缩小再放大
+        small_w = max(1, w // size)
+        small_h = max(1, h // size)
+        
+        temp = cv2.resize(roi, (small_w, small_h), interpolation=cv2.INTER_LINEAR)
         pixelated = cv2.resize(temp, (w, h), interpolation=cv2.INTER_NEAREST)
+        
         frame[y1:y2, x1:x2] = pixelated
         return frame
     
@@ -633,52 +616,41 @@ class RealtimeCascadeDetector:
 
         return frame
     
-    def _merge_audio(self, video_source, output_path):
-        """用 ffmpeg 将原视频的音频合并到输出视频"""
-        import subprocess
-        import os
-        
-        temp_video = output_path
-        final_video = output_path.replace('.mp4', '_with_audio.mp4')
-        
+    def _merge_audio(self, video_source, temp_video, output_path):
+        """用 ffmpeg 将原视频的音频合并到输出视频（视频流直接 copy）"""
         try:
-            # 检查原视频是否有音频
             probe_cmd = [
                 'ffprobe', '-v', 'error', '-select_streams', 'a:0',
                 '-show_entries', 'stream=codec_type',
-                '-of', 'csv=p=0', video_source
+                '-of', 'csv=p=0', str(video_source)
             ]
             result = subprocess.run(probe_cmd, capture_output=True, text=True)
             
             if 'audio' not in result.stdout:
                 print("原视频没有音频轨道，跳过音频合并")
+                os.rename(temp_video, output_path)
                 return
             
-            # 合并视频和音频
             merge_cmd = [
-                'ffmpeg', '-y',  # -y 覆盖输出文件
-                '-i', temp_video,      # 输入：无声视频
-                '-i', video_source,    # 输入：原视频（取其音频）
-                '-c:v', 'copy',        # 视频直接复制
-                '-c:a', 'aac',         # 音频编码为 AAC
-                '-map', '0:v:0',       # 使用第一个输入的视频流
-                '-map', '1:a:0',       # 使用第二个输入的音频流
-                '-shortest',           # 以较短的流为准
-                final_video
+                'ffmpeg', '-y',
+                '-i', temp_video,
+                '-i', str(video_source),
+                '-c:v', 'copy',
+                '-c:a', 'aac',
+                '-map', '0:v:0',
+                '-map', '1:a:0',
+                '-shortest',
+                output_path
             ]
             
             print("正在合并音频...")
             subprocess.run(merge_cmd, capture_output=True, check=True)
-            
-            # 替换原文件
-            os.replace(final_video, output_path)
             print(f"音频合并完成: {output_path}")
             
         except subprocess.CalledProcessError as e:
             print(f"音频合并失败: {e.stderr.decode() if e.stderr else str(e)}")
+            os.rename(temp_video, output_path)
             print(f"无声视频已保存为: {output_path}")
-
-
 
     def _process_video(self, video_source, output_path, preview):
         """处理单个视频，返回是否正常完成"""
@@ -696,8 +668,43 @@ class RealtimeCascadeDetector:
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-        out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+        
+        # 检查输入视频时长（用于码率计算）
+        duration = 0
+        if video_source != 0:
+            try:
+                dur_cmd = ['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0', str(video_source)]
+                dur_result = subprocess.run(dur_cmd, capture_output=True, text=True)
+                duration = float(dur_result.stdout.strip())
+            except:
+                duration = total_frames / fps if fps > 0 else 0
+        
+        target_size = self.control_panel.get_target_size_mb()
+        
+        # 构建 ffmpeg 命令
+        temp_output = output_path.replace('.mp4', '_noaudio.mp4')
+        ffmpeg_cmd = ['ffmpeg', '-y', '-f', 'rawvideo', '-vcodec', 'rawvideo',
+                      '-pix_fmt', 'bgr24', '-s', f'{width}x{height}', '-r', str(fps),
+                      '-i', '-']
+        
+        if target_size > 0 and duration > 0:
+            # 有目标大小：计算码率
+            target_bitrate = (target_size * 8 * 1024) / duration  # kbps
+            video_bitrate = int(target_bitrate * 0.9)  # 预留音频空间
+            ffmpeg_cmd.extend(['-c:v', 'libx264', '-preset', 'medium',
+                              '-b:v', f'{video_bitrate}k',
+                              '-maxrate', f'{int(target_bitrate)}k',
+                              '-bufsize', f'{int(target_bitrate * 2)}k'])
+            print(f"目标码率: {video_bitrate}kbps")
+        else:
+            # 无目标大小：CRF 模式
+            ffmpeg_cmd.extend(['-c:v', 'libx264', '-preset', 'medium', '-crf', '23'])
+        
+        ffmpeg_cmd.append(temp_output)
+        
+        # 启动 ffmpeg 进程
+        ffmpeg_proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE,
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
         os.makedirs('./debug_roi', exist_ok=True)
         frame_id = 0
@@ -733,11 +740,10 @@ class RealtimeCascadeDetector:
                 if roi.size == 0:
                     continue
 
-                # 关键：不手动 resize，直接送入 ROI，且指定 imgsz 与引擎输出一致
                 precise_results = self.precise_model(
                     roi,
                     conf=0.3,
-                    imgsz=(640, 384)   # 高640，宽384
+                    imgsz=(640, 384)
                 )
 
                 for pr in precise_results[0].boxes:
@@ -758,11 +764,8 @@ class RealtimeCascadeDetector:
                 # 调试保存（带检测框的 ROI）
                 if frame_id % 30 == 0:
                     roi_annotated = roi.copy()
-                    # 只画属于当前 roi 的检测框
                     for det in final_detections:
-                        # 检测框坐标是全局的，需要转换回 roi 内坐标
                         gx1, gy1, gx2, gy2 = det['bbox']
-                        # 检查这个框是否落在当前 roi 区域内（简单包含判断）
                         if gx1 >= x1 and gy1 >= y1 and gx2 <= x2 and gy2 <= y2:
                             rx1 = gx1 - x1
                             ry1 = gy1 - y1
@@ -775,9 +778,9 @@ class RealtimeCascadeDetector:
                                         cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
                     cv2.imwrite(f'./debug_roi/debug_roi_{frame_id}_{idx}.jpg', roi_annotated)
 
-            # 绘制并保存
+            # 绘制并写入 ffmpeg 管道
             annotated = self.draw_results(frame, final_detections)
-            out.write(annotated)
+            ffmpeg_proc.stdin.write(annotated.tobytes())
 
             # FPS 计算（每 10 帧更新一次）
             fps_frame_count += 1
@@ -787,11 +790,9 @@ class RealtimeCascadeDetector:
                 fps_start_time = time.time()
                 fps_frame_count = 0
 
-            # 在帧上绘制 FPS
-            fps_text = f"FPS: {current_fps:.1f}"
-
             # 预览（可选）
             if preview:
+                fps_text = f"FPS: {current_fps:.1f}"
                 cv2.putText(annotated, fps_text, (10, 30), 
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
                 cv2.imshow('Cascade Detection', annotated)
@@ -810,13 +811,18 @@ class RealtimeCascadeDetector:
 
         # 最终统计
         cap.release()
-        out.release()
+        ffmpeg_proc.stdin.close()
+        ffmpeg_proc.wait()
         if preview:
             cv2.destroyAllWindows()
         
-        # 合并音频（如果有 ffmpeg 且非摄像头）
+        # 合并音频（视频已是 H.264，直接 copy，不重编码）
         if self.has_ffmpeg and video_source != 0:
-            self._merge_audio(video_source, output_path)
+            self._merge_audio(video_source, temp_output, output_path)
+            if os.path.exists(temp_output):
+                os.remove(temp_output)
+        else:
+            os.rename(temp_output, output_path)
         
         # 不关闭控制面板，只更新状态
         self.control_panel.status_label.configure(
@@ -843,12 +849,12 @@ class RealtimeCascadeDetector:
             time.sleep(0.05)
         
         while True:
-            video_sources = self.control_panel.get_video_path()
+            video_sources = self.control_panel.get_video_paths()
             output_base = self.control_panel.get_output_path()
             preview = self.control_panel.get_preview()
             
             # 判断处理模式
-            if not video_sources or video_sources == ["0"]:
+            if video_sources == [0]:
                 # 摄像头模式
                 self._process_video(0, "camera_output.mp4", preview)
                 success = True
@@ -887,7 +893,7 @@ class RealtimeCascadeDetector:
             
             if success:
                 self.control_panel.status_label.configure(
-                    text=f"处理完成！共处理 {len(video_sources) if video_sources and video_sources[0] != '0' else 0} 个视频 | 可重新选择视频并开始",
+                    text=f"处理完成！共处理 {len(video_sources) if video_sources and video_sources[0] != 0 else 0} 个视频 | 可重新选择视频并开始",
                     foreground="blue"
                 )
             else:
