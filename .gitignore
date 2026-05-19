@@ -1,0 +1,62 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+.venv
+pip-log.txt
+pip-delete-this-directory.txt
+.pytest_cache/
+.coverage
+*.cover
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# UV (包管理器)
+uv.lock
+.uv/
+
+# 视频和图片文件（大的数据文件）
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.flv
+*.jpg
+*.jpeg
+*.png
+*.bmp
+*.tiff
+
+# YOLO 模型文件（通常很大）
+*.pt
+*.pth
+*.onnx
+*.engine
+*.weights
+
+# 临时文件
+temp_roi.jpg
+temp_roi_*.jpg
+*.tmp
+
+# IDE
+.vscode/
+.history/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# 输出文件
+output.mp4
+result.mp4
+output_with_annotations.mp4
+result.jpg
