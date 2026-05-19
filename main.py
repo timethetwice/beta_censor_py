@@ -33,6 +33,8 @@ class DetectionControlPanel:
         self._started = False
         self._stopped = False
         self._current_fps = 0.0
+        self._current_frame = 0
+        self._total_frames = 0
 
         self.root.geometry("500x600")
         self.root.minsize(450, 500)
@@ -83,7 +85,9 @@ class DetectionControlPanel:
             btn_frame, text="■  停止", command=self._on_stop, state="disabled"
         )
         self.stop_btn.pack(side=tk.LEFT, padx=5)
-        self.fps_label = ttk.Label(bottom_frame, text="FPS: 0.0", foreground="gray")
+        self.fps_label = ttk.Label(
+            bottom_frame, text="FPS: 0.0 | 帧: 0 / 0", foreground="gray"
+        )
         self.fps_label.pack()
         self.status_label = ttk.Label(
             bottom_frame,
@@ -381,7 +385,16 @@ class DetectionControlPanel:
 
     def update_fps(self, fps):
         self._current_fps = fps
-        self.fps_label.configure(text=f"FPS: {fps:.1f}")
+        self.fps_label.configure(
+            text=f"FPS: {fps:.1f} | 帧: {self._current_frame} / {self._total_frames}"
+        )
+
+    def update_frame_count(self, current, total):
+        self._current_frame = current
+        self._total_frames = total
+        self.fps_label.configure(
+            text=f"FPS: {self._current_fps:.1f} | 帧: {current} / {total}"
+        )
 
     def is_started(self):
         return self._started
@@ -969,6 +982,7 @@ class RealtimeCascadeDetector:
                 fps_start_time = time.time()
                 fps_frame_count = 0
                 self.control_panel.update_fps(current_fps)
+                self.control_panel.update_frame_count(frame_id, total_frames)
 
             # 预览（可选）
             if preview:
