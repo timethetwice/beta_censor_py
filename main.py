@@ -2,6 +2,7 @@ from ultralytics import YOLO
 import cv2
 import tkinter as tk
 from tkinter import ttk, filedialog
+from collections import deque
 import os
 import numpy as np
 import subprocess
@@ -641,7 +642,7 @@ class RealtimeCascadeDetector:
         self.control_panel = None
 
         # 遮蔽缓冲区：保存最近 N 帧的检测结果
-        self.censor_buffer = []  # 列表，每个元素是 (剩余帧数, detections)
+        self.censor_buffer = None  # 延迟初始化为 deque
         self.buffer_frames = 5  # 缓冲帧数
         # 检查 ffmpeg 是否可用
         self.has_ffmpeg = self._check_ffmpeg()
@@ -820,16 +821,17 @@ class RealtimeCascadeDetector:
 
         # ========== 更新缓冲区 ==========
         if buffer_frames > 0:
-            self.censor_buffer.append((buffer_frames, current_detections))
+            if self.censor_buffer is None:
+                self.censor_buffer = deque(maxlen=buffer_frames)
+            self.censor_buffer.append(current_detections)
 
         # ========== 收集所有需要遮蔽的框 ==========
         all_boxes = []
 
         # 如果缓冲帧数 > 0，使用缓冲
-        if buffer_frames > 0:
-            for remaining, dets in self.censor_buffer:
-                for det in dets:
-                    all_boxes.append(det)
+        if buffer_frames > 0 and self.censor_buffer:
+            for dets in self.censor_buffer:
+                all_boxes.extend(dets)
         else:
             # 缓冲帧数为 0，只使用当前帧
             all_boxes = current_detections
@@ -856,14 +858,6 @@ class RealtimeCascadeDetector:
             elif mode == "distortion":
                 strength = params.get("strength", 15)
                 CensorEffects.distortion(frame, x1, y1, x2, y2, strength=strength)
-
-        # ========== 更新缓冲区：减少剩余帧数，移除过期条目 ==========
-        new_buffer = []
-        for remaining, dets in self.censor_buffer:
-            remaining -= 1
-            if remaining > 0:
-                new_buffer.append((remaining, dets))
-        self.censor_buffer = new_buffer
 
         return frame
 
@@ -1009,7 +1003,7 @@ class RealtimeCascadeDetector:
 
         os.makedirs("./debug_roi", exist_ok=True)
         frame_id = 0
-        self.censor_buffer = []
+        self.censor_buffer = None  # 延迟初始化为 deque
 
         # FPS 计时
         fps_start_time = time.time()
@@ -1027,14 +1021,13 @@ class RealtimeCascadeDetector:
             # ----------------- 第一阶段：检测人 -----------------
             results_fast = self.fast_model(frame, conf=0.3, classes=[0])
             candidates = []
-            h, w = frame.shape[:2]
             for box in results_fast[0].boxes:
                 x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
                 pad = 50
                 x1 = max(0, x1 - pad)
                 y1 = max(0, y1 - pad)
-                x2 = min(w, x2 + pad)
-                y2 = min(h, y2 + pad)
+                x2 = min(width, x2 + pad)
+                y2 = min(height, y2 + pad)
                 candidates.append((x1, y1, x2, y2))
 
             # ----------------- 第二阶段：NudeNet 检测（批量分片）-----------------
