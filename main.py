@@ -35,6 +35,7 @@ class DetectionControlPanel:
         self._current_fps = 0.0
         self._current_frame = 0
         self._total_frames = 0
+        self._debug_enabled = tk.BooleanVar(value=False)
 
         self.root.geometry("500x600")
         self.root.minsize(450, 500)
@@ -138,6 +139,11 @@ class DetectionControlPanel:
         ttk.Checkbutton(
             parent, text="显示预览窗口（关闭可加速）", variable=self._show_preview
         ).pack(anchor="w", pady=(10, 0))
+
+        # 调试开关
+        ttk.Checkbutton(
+            parent, text="保存调试图片", variable=self._debug_enabled
+        ).pack(anchor="w", pady=(5, 0))
 
     def _build_censor_tab(self, parent):
         # 遮蔽方式选择
@@ -454,6 +460,9 @@ class DetectionControlPanel:
     def get_preview(self):
         return self._show_preview.get()
 
+    def get_debug_enabled(self):
+        return self._debug_enabled.get()
+
     def get_target_size_mb(self):
         return self._target_size_mb.get()
 
@@ -694,7 +703,7 @@ class RealtimeCascadeDetector:
         eye_detections 是同一 face_idx 的眼睛列表
         """
         eye_padding_x_ratio = 0.3
-        eye_padding_y_ratio = 0.15
+        eye_padding_y_ratio = 0.3
         if len(eye_detections) == 0:
             return []
         if len(eye_detections) == 1:
@@ -749,14 +758,22 @@ class RealtimeCascadeDetector:
             "FEMALE_BREAST_COVERED",
             "MALE_BREAST_EXPOSED",
         ]
+        genitalia_labels = [
+            "FEMALE_GENITALIA_EXPOSED",
+            "FEMALE_GENITALIA_COVERED",
+            "MALE_GENITALIA_EXPOSED",
+        ]
 
         breast_detections = []
+        genitalia_detections = []
         eye_detections = []
         other_detections = []
 
         for det in detections:
             if det["class_name"] in breast_labels:
                 breast_detections.append(det)
+            elif det["class_name"] in genitalia_labels:
+                genitalia_detections.append(det)
             elif det["class_name"] == "eye":
                 eye_detections.append(det)
             else:
@@ -780,11 +797,26 @@ class RealtimeCascadeDetector:
         for pid, breasts in person_breast_map.items():
             merged_breast.extend(self._merge_breast_boxes(breasts))
 
+        merged_genitalia = []
+        for det in genitalia_detections:
+            x1, y1, x2, y2 = det["bbox"]
+            width = x2 - x1
+            height = y2 - y1
+            padding_x = int(width * 1)
+            padding_y = int(height * 0.15)
+            det["bbox"] = (
+                x1 - padding_x,
+                y1 - padding_y,
+                x2 + padding_x,
+                y2 + padding_y,
+            )
+            merged_genitalia.append(det)
+
         merged_eyes = []
         for pid, eyes in person_eye_map.items():
             merged_eyes.extend(self._merge_eye_boxes(eyes))
 
-        current_detections = merged_breast + merged_eyes + other_detections
+        current_detections = merged_breast + merged_genitalia + merged_eyes + other_detections
 
         # ========== 更新缓冲区 ==========
         if buffer_frames > 0:
@@ -1005,95 +1037,132 @@ class RealtimeCascadeDetector:
                 y2 = min(h, y2 + pad)
                 candidates.append((x1, y1, x2, y2))
 
-            # ----------------- 第二阶段：NudeNet 检测 -----------------
+            # ----------------- 第二阶段：NudeNet 检测（批量分片）-----------------
             final_detections = []
             face_rois = {}
+
+            person_rois = []
+            person_indices = []
+            person_roi_data = []
             for idx, (x1, y1, x2, y2) in enumerate(candidates):
                 roi = frame[y1:y2, x1:x2]
                 if roi.size == 0:
                     continue
+                person_rois.append(roi)
+                person_indices.append(idx)
+                person_roi_data.append((idx, x1, y1))
 
-                precise_results = self.precise_model(roi, conf=0.3, imgsz=(640, 384))
+            BATCH_SIZE = 2
+            if person_rois:
+                for batch_start in range(0, len(person_rois), BATCH_SIZE):
+                    batch_end = min(batch_start + BATCH_SIZE, len(person_rois))
+                    batch_rois = person_rois[batch_start:batch_end]
+                    batch_indices = person_indices[batch_start:batch_end]
+                    batch_roi_data = person_roi_data[batch_start:batch_end]
 
-                for pr in precise_results[0].boxes:
-                    rx1, ry1, rx2, ry2 = map(int, pr.xyxy[0].tolist())
-                    conf = float(pr.conf[0])
-                    cls = int(pr.cls[0])
-                    label_name = self.get_label_name(cls)
+                    precise_results = self.precise_model(batch_rois, conf=0.2, imgsz=(640, 384), rect=False)
 
-                    final_detections.append(
-                        {
-                            "bbox": (x1 + rx1, y1 + ry1, x1 + rx2, y1 + ry2),
-                            "class": cls,
-                            "class_name": label_name,
-                            "confidence": conf,
-                            "is_sensitive": label_name in self.sensitive_labels,
-                            "is_female": label_name in self.female_sensitive_labels,
-                            "person_idx": idx,
-                        }
-                    )
+                    for i, res in enumerate(precise_results):
+                        person_idx = batch_indices[i]
+                        idx, x1, y1 = batch_roi_data[i]
 
-                    if label_name in ("FACE_FEMALE", "FACE_MALE"):
-                        face_rois[idx] = (x1 + rx1, y1 + ry1, x1 + rx2, y1 + ry2)
+                        for pr in res.boxes:
+                            rx1, ry1, rx2, ry2 = map(int, pr.xyxy[0].tolist())
+                            conf = float(pr.conf[0])
+                            cls = int(pr.cls[0])
+                            label_name = self.get_label_name(cls)
 
-                # 调试保存（带检测框的 ROI）
-                if frame_id % 30 == 0:
-                    roi_annotated = roi.copy()
-                    for det in final_detections:
-                        gx1, gy1, gx2, gy2 = det["bbox"]
-                        if gx1 >= x1 and gy1 >= y1 and gx2 <= x2 and gy2 <= y2:
-                            rx1 = gx1 - x1
-                            ry1 = gy1 - y1
-                            rx2 = gx2 - x1
-                            ry2 = gy2 - y1
-                            color = (
-                                (0, 0, 255) if det["is_sensitive"] else (0, 255, 255)
+                            final_detections.append(
+                                {
+                                    "bbox": (x1 + rx1, y1 + ry1, x1 + rx2, y1 + ry2),
+                                    "class": cls,
+                                    "class_name": label_name,
+                                    "confidence": conf,
+                                    "is_sensitive": label_name in self.sensitive_labels,
+                                    "is_female": label_name in self.female_sensitive_labels,
+                                    "person_idx": person_idx,
+                                }
                             )
-                            cv2.rectangle(
-                                roi_annotated, (rx1, ry1), (rx2, ry2), color, 2
-                            )
-                            label = f"{det['class_name']}: {det['confidence']:.2f}"
-                            cv2.putText(
-                                roi_annotated,
-                                label,
-                                (rx1, ry1 - 5),
-                                cv2.FONT_HERSHEY_SIMPLEX,
-                                0.4,
-                                color,
-                                1,
-                            )
-                    cv2.imwrite(
-                        f"./debug_roi/debug_roi_{frame_id}_{idx}.jpg", roi_annotated
-                    )
 
-            # ----------------- 第三阶段：Eye 模型检测 -----------------
-            for person_idx, (fx1, fy1, fx2, fy2) in face_rois.items():
-                face_roi = frame[fy1:fy2, fx1:fx2]
-                if face_roi.size == 0:
-                    continue
-                eye_results = self.eye_model(face_roi, conf=0.25, imgsz=320)
-                for er in eye_results[0].boxes:
-                    cls_id = int(er.cls[0])
-                    label_name = self.eye_model.names[cls_id]
-                    if label_name != "eye":
+                            if label_name in ("FACE_FEMALE", "FACE_MALE"):
+                                face_rois[person_idx] = (x1 + rx1, y1 + ry1, x1 + rx2, y1 + ry2)
+
+                        if self.control_panel.get_debug_enabled() and frame_id % 30 == 0:
+                            roi_annotated = batch_rois[i].copy()
+                            for det in final_detections:
+                                if det["person_idx"] == person_idx:
+                                    gx1, gy1, gx2, gy2 = det["bbox"]
+                                    rx1 = gx1 - x1
+                                    ry1 = gy1 - y1
+                                    rx2 = gx2 - x1
+                                    ry2 = gy2 - y1
+                                    color = (
+                                        (0, 0, 255) if det["is_sensitive"] else (0, 255, 255)
+                                    )
+                                    cv2.rectangle(
+                                        roi_annotated, (rx1, ry1), (rx2, ry2), color, 2
+                                    )
+                                    label = f"{det['class_name']}: {det['confidence']:.2f}"
+                                    cv2.putText(
+                                        roi_annotated,
+                                        label,
+                                        (rx1, ry1 - 5),
+                                        cv2.FONT_HERSHEY_SIMPLEX,
+                                        0.4,
+                                        color,
+                                        1,
+                                    )
+                            cv2.imwrite(
+                                f"./debug_roi/debug_roi_{frame_id}_{person_idx}.jpg", roi_annotated
+                            )
+
+            # ----------------- 第三阶段：Eye 模型检测（批量分片）-----------------
+            if face_rois:
+                face_roi_list = []
+                face_idx_list = []
+                face_roi_coords = {}
+                for person_idx, (fx1, fy1, fx2, fy2) in face_rois.items():
+                    face_roi = frame[fy1:fy2, fx1:fx2]
+                    if face_roi.size == 0:
                         continue
-                    er_x1, er_y1, er_x2, er_y2 = map(int, er.xyxy[0].tolist())
-                    final_detections.append(
-                        {
-                            "bbox": (
-                                fx1 + er_x1,
-                                fy1 + er_y1,
-                                fx1 + er_x2,
-                                fy1 + er_y2,
-                            ),
-                            "class": 999,
-                            "class_name": "eye",
-                            "confidence": float(er.conf[0]),
-                            "is_sensitive": True,
-                            "is_female": True,
-                            "person_idx": person_idx,
-                        }
-                    )
+                    face_roi_list.append(face_roi)
+                    face_idx_list.append(person_idx)
+                    face_roi_coords[person_idx] = (fx1, fy1)
+
+                if face_roi_list:
+                    for batch_start in range(0, len(face_roi_list), BATCH_SIZE):
+                        batch_end = min(batch_start + BATCH_SIZE, len(face_roi_list))
+                        batch_rois = face_roi_list[batch_start:batch_end]
+                        batch_indices = face_idx_list[batch_start:batch_end]
+
+                        eye_results = self.eye_model(batch_rois, conf=0.2, imgsz=320, rect=False)
+
+                        for i, res in enumerate(eye_results):
+                            person_idx = batch_indices[i]
+                            fx1, fy1 = face_roi_coords[person_idx]
+
+                            for er in res.boxes:
+                                cls_id = int(er.cls[0])
+                                label_name = self.eye_model.names[cls_id]
+                                if label_name != "eye":
+                                    continue
+                                er_x1, er_y1, er_x2, er_y2 = map(int, er.xyxy[0].tolist())
+                                final_detections.append(
+                                    {
+                                        "bbox": (
+                                            fx1 + er_x1,
+                                            fy1 + er_y1,
+                                            fx1 + er_x2,
+                                            fy1 + er_y2,
+                                        ),
+                                        "class": 999,
+                                        "class_name": "eye",
+                                        "confidence": float(er.conf[0]),
+                                        "is_sensitive": True,
+                                        "is_female": True,
+                                        "person_idx": person_idx,
+                                    }
+                                )
 
             # 绘制并写入 ffmpeg 管道
             annotated = self.draw_results(frame, final_detections)
