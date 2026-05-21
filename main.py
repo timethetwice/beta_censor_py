@@ -7,12 +7,153 @@ import os
 import numpy as np
 import subprocess
 import platform
+import queue
+import threading
 
 
-import tkinter as tk
-from tkinter import ttk, filedialog
-import os
-import cv2
+class VideoReader:
+    def __init__(self, source, queue_size=4, use_gpu=False):
+        self.source = source
+        self.queue = queue.Queue(maxsize=queue_size)
+        self.thread = None
+        self.running = False
+        self.cap = None
+        self.proc = None
+        self.ret = False
+        self.frame = None
+        self.use_gpu = use_gpu and source != 0
+
+    def _reader_loop(self):
+        if self.use_gpu:
+            self._gpu_reader_loop()
+        else:
+            self._cpu_reader_loop()
+
+    def _cpu_reader_loop(self):
+        while self.running:
+            if self.cap is None:
+                break
+            ret, frame = self.cap.read()
+            if not ret:
+                self.queue.put((None, None))
+                break
+            self.queue.put((ret, frame.copy()))
+
+    def _get_cuvid_decoder(self, source):
+        try:
+            result = subprocess.run(
+                ["ffprobe", "-v", "error", "-select_streams", "v:0", 
+                 "-show_entries", "stream=codec_name", "-of", "csv=p=0", str(source)],
+                capture_output=True, text=True, timeout=5
+            )
+            codec = result.stdout.strip().lower()
+            if codec in ("hevc", "h265"):
+                return "hevc_cuvid"
+            return "h264_cuvid"
+        except:
+            return "h264_cuvid"
+
+    def _gpu_reader_loop(self):
+        import subprocess
+        cuvid = self._get_cuvid_decoder(self.source)
+        cmd = [
+            "ffmpeg",
+            "-c:v", cuvid,
+            "-i", str(self.source),
+            "-f", "rawvideo",
+            "-pix_fmt", "bgr24",
+            "-"
+        ]
+        try:
+            self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            frame_size = self.width * self.height * 3
+            while self.running:
+                raw = self.proc.stdout.read(frame_size)
+                if len(raw) < frame_size:
+                    break
+                frame = np.frombuffer(raw, dtype=np.uint8).reshape((self.height, self.width, 3)).copy()
+                self.queue.put((True, frame))
+            self.proc.terminate()
+        except Exception as e:
+            print(f"GPU decode error: {e}")
+        finally:
+            self.queue.put((False, None))
+
+    def start(self):
+        if self.source == 0:
+            self.use_gpu = False
+            self.cap = cv2.VideoCapture(0)
+            if not self.cap.isOpened():
+                return False
+        elif self.use_gpu:
+            temp_cap = cv2.VideoCapture(self.source)
+            if not temp_cap.isOpened():
+                self.use_gpu = False
+                self.cap = temp_cap
+                if not self.cap.isOpened():
+                    return False
+            self.width = int(temp_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            self.height = int(temp_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            self.fps = temp_cap.get(cv2.CAP_PROP_FPS)
+            temp_cap.release()
+        else:
+            self.cap = cv2.VideoCapture(self.source)
+            if not self.cap.isOpened():
+                return False
+
+        self.running = True
+        self.thread = threading.Thread(target=self._reader_loop, daemon=True)
+        self.thread.start()
+        return True
+
+    def read(self):
+        try:
+            self.ret, self.frame = self.queue.get(timeout=1.0)
+            return self.ret, self.frame
+        except queue.Empty:
+            return False, None
+
+    def stop(self):
+        self.running = False
+        if self.thread:
+            self.thread.join(timeout=1.0)
+        if self.proc:
+            self.proc.terminate()
+            self.proc = None
+        if self.cap:
+            self.cap.release()
+            self.cap = None
+
+    def get_fps(self):
+        if self.use_gpu:
+            return getattr(self, 'fps', 30.0)
+        if self.cap:
+            return self.cap.get(cv2.CAP_PROP_FPS)
+        return 30.0
+
+    def get_frame_count(self):
+        if self.use_gpu:
+            return 0
+        if self.cap:
+            return int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        return 0
+
+    def get_width(self):
+        if self.use_gpu:
+            return getattr(self, 'width', 0)
+        if self.cap:
+            return int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        return 0
+
+    def get_height(self):
+        if self.use_gpu:
+            return getattr(self, 'height', 0)
+        if self.cap:
+            return int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        return 0
+
+    def is_opened(self):
+        return (self.cap is not None and self.cap.isOpened()) or self.proc is not None
 
 
 class DetectionControlPanel:
@@ -140,6 +281,12 @@ class DetectionControlPanel:
         ttk.Checkbutton(
             parent, text="显示预览窗口（关闭可加速）", variable=self._show_preview
         ).pack(anchor="w", pady=(10, 0))
+
+        # 720p 加速开关
+        self._downscale_720p = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            parent, text="启用 720p 加速（降低分辨率加快处理）", variable=self._downscale_720p
+        ).pack(anchor="w", pady=(5, 0))
 
         # 调试开关
         ttk.Checkbutton(
@@ -463,6 +610,9 @@ class DetectionControlPanel:
 
     def get_debug_enabled(self):
         return self._debug_enabled.get()
+
+    def get_downscale_720p(self):
+        return self._downscale_720p.get()
 
     def get_target_size_mb(self):
         return self._target_size_mb.get()
@@ -915,18 +1065,26 @@ class RealtimeCascadeDetector:
         """处理单个视频，返回是否正常完成"""
         import time
 
-        if video_source == 0:
-            cap = cv2.VideoCapture(0)
-        else:
-            cap = cv2.VideoCapture(video_source)
-        if not cap.isOpened():
+        reader = VideoReader(video_source, use_gpu=True)
+        if not reader.start():
             print(f"无法打开视频源: {video_source}")
             return
 
-        fps = cap.get(cv2.CAP_PROP_FPS)
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = reader.get_fps()
+        total_frames = reader.get_frame_count()
+        orig_width = reader.get_width()
+        orig_height = reader.get_height()
+
+        # 720p 加速模式
+        downscale_720p = self.control_panel.get_downscale_720p()
+        if downscale_720p:
+            target_height = 720
+            target_width = int(orig_width * (target_height / orig_height))
+            target_width = (target_width // 2) * 2
+            target_height = (target_height // 2) * 2
+        else:
+            target_width = orig_width
+            target_height = orig_height
 
         # 检查输入视频时长（用于码率计算）
         duration = 0
@@ -961,7 +1119,7 @@ class RealtimeCascadeDetector:
             "-pix_fmt",
             "bgr24",
             "-s",
-            f"{width}x{height}",
+            f"{target_width}x{target_height}",
             "-r",
             str(fps),
             "-i",
@@ -1014,9 +1172,13 @@ class RealtimeCascadeDetector:
             if self.control_panel.is_stopped():
                 print("用户停止处理")
                 break
-            ret, frame = cap.read()
+            ret, frame = reader.read()
             if not ret:
                 break
+
+            # 720p 加速模式：缩小到 720p
+            if downscale_720p:
+                frame = cv2.resize(frame, (target_width, target_height), interpolation=cv2.INTER_LINEAR)
 
             # ----------------- 第一阶段：检测人 -----------------
             results_fast = self.fast_model(frame, conf=0.3, classes=[0])
@@ -1026,8 +1188,8 @@ class RealtimeCascadeDetector:
                 pad = 50
                 x1 = max(0, x1 - pad)
                 y1 = max(0, y1 - pad)
-                x2 = min(width, x2 + pad)
-                y2 = min(height, y2 + pad)
+                x2 = min(target_width, x2 + pad)
+                y2 = min(target_height, y2 + pad)
                 candidates.append((x1, y1, x2, y2))
 
             # ----------------- 第二阶段：NudeNet 检测（批量分片）-----------------
@@ -1200,7 +1362,7 @@ class RealtimeCascadeDetector:
                 break
 
         # 最终统计
-        cap.release()
+        reader.stop()
         ffmpeg_proc.stdin.close()
         ffmpeg_proc.wait()
         if preview:
