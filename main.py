@@ -95,6 +95,7 @@ class VideoReader:
             self.width = int(temp_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             self.height = int(temp_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             self.fps = temp_cap.get(cv2.CAP_PROP_FPS)
+            self.frame_count = int(temp_cap.get(cv2.CAP_PROP_FRAME_COUNT))
             temp_cap.release()
         else:
             self.cap = cv2.VideoCapture(self.source)
@@ -133,7 +134,7 @@ class VideoReader:
 
     def get_frame_count(self):
         if self.use_gpu:
-            return 0
+            return getattr(self, 'frame_count', 0)
         if self.cap:
             return int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
         return 0
