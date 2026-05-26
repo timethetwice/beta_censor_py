@@ -6,156 +6,12 @@ import os
 import numpy as np
 import subprocess
 import platform
-import queue
-import threading
-
-from Screen_Censor import TransparentProtectionWindow
 
 
-class VideoReader:
-    def __init__(self, source, queue_size=4, use_gpu=False):
-        self.source = source
-        self.queue = queue.Queue(maxsize=queue_size)
-        self.thread = None
-        self.running = False
-        self.cap = None
-        self.proc = None
-        self.ret = False
-        self.frame = None
-        self.use_gpu = use_gpu and source != 0
-
-    def _reader_loop(self):
-        if self.use_gpu:
-            self._gpu_reader_loop()
-        else:
-            self._cpu_reader_loop()
-
-    def _cpu_reader_loop(self):
-        while self.running:
-            if self.cap is None:
-                break
-            ret, frame = self.cap.read()
-            if not ret:
-                self.queue.put((None, None))
-                break
-            self.queue.put((ret, frame.copy()))
-
-    def _get_cuvid_decoder(self, source):
-        try:
-            result = subprocess.run(
-                ["ffprobe", "-v", "error", "-select_streams", "v:0", 
-                 "-show_entries", "stream=codec_name", "-of", "csv=p=0", str(source)],
-                capture_output=True, text=True, timeout=5
-            )
-            codec = result.stdout.strip().lower()
-            if codec in ("hevc", "h265"):
-                return "hevc_cuvid"
-            return "h264_cuvid"
-        except:
-            return "h264_cuvid"
-
-    def _gpu_reader_loop(self):
-        import subprocess
-        cuvid = self._get_cuvid_decoder(self.source)
-        cmd = [
-            "ffmpeg",
-            "-c:v", cuvid,
-            "-i", str(self.source),
-            "-f", "rawvideo",
-            "-pix_fmt", "bgr24",
-            "-"
-        ]
-        try:
-            self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-            frame_size = self.width * self.height * 3
-            while self.running:
-                raw = self.proc.stdout.read(frame_size)
-                if len(raw) < frame_size:
-                    break
-                frame = np.frombuffer(raw, dtype=np.uint8).reshape((self.height, self.width, 3)).copy()
-                self.queue.put((True, frame))
-            self.proc.terminate()
-        except Exception as e:
-            print(f"GPU decode error: {e}")
-        finally:
-            self.queue.put((False, None))
-
-    def start(self):
-        if self.source == 0:
-            self.use_gpu = False
-            self.cap = cv2.VideoCapture(0)
-            if not self.cap.isOpened():
-                return False
-        elif self.use_gpu:
-            temp_cap = cv2.VideoCapture(self.source)
-            if not temp_cap.isOpened():
-                self.use_gpu = False
-                self.cap = temp_cap
-                if not self.cap.isOpened():
-                    return False
-            self.width = int(temp_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            self.height = int(temp_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            self.fps = temp_cap.get(cv2.CAP_PROP_FPS)
-            self.frame_count = int(temp_cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            temp_cap.release()
-        else:
-            self.cap = cv2.VideoCapture(self.source)
-            if not self.cap.isOpened():
-                return False
-
-        self.running = True
-        self.thread = threading.Thread(target=self._reader_loop, daemon=True)
-        self.thread.start()
-        return True
-
-    def read(self):
-        try:
-            self.ret, self.frame = self.queue.get(timeout=1.0)
-            return self.ret, self.frame
-        except queue.Empty:
-            return False, None
-
-    def stop(self):
-        self.running = False
-        if self.thread:
-            self.thread.join(timeout=1.0)
-        if self.proc:
-            self.proc.terminate()
-            self.proc = None
-        if self.cap:
-            self.cap.release()
-            self.cap = None
-
-    def get_fps(self):
-        if self.use_gpu:
-            return getattr(self, 'fps', 30.0)
-        if self.cap:
-            return self.cap.get(cv2.CAP_PROP_FPS)
-        return 30.0
-
-    def get_frame_count(self):
-        if self.use_gpu:
-            return getattr(self, 'frame_count', 0)
-        if self.cap:
-            return int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        return 0
-
-    def get_width(self):
-        if self.use_gpu:
-            return getattr(self, 'width', 0)
-        if self.cap:
-            return int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        return 0
-
-    def get_height(self):
-        if self.use_gpu:
-            return getattr(self, 'height', 0)
-        if self.cap:
-            return int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        return 0
-
-    def is_opened(self):
-        return (self.cap is not None and self.cap.isOpened()) or self.proc is not None
+import tkinter as tk
+from tkinter import ttk, filedialog
+import os
+import cv2
 
 
 class DetectionControlPanel:
@@ -179,7 +35,6 @@ class DetectionControlPanel:
         self._current_fps = 0.0
         self._current_frame = 0
         self._total_frames = 0
-        self._debug_enabled = tk.BooleanVar(value=False)
 
         self.root.geometry("500x600")
         self.root.minsize(450, 500)
@@ -189,6 +44,7 @@ class DetectionControlPanel:
         self._output_path = tk.StringVar(value="output_censored.mp4")
         self._target_size_mb = tk.DoubleVar(value=0)
         self._nude_model = tk.StringVar(value="640m")
+        self._resize_720p = tk.BooleanVar(value=False)
 
         self._censor_mode = tk.StringVar(value="black")
         self._blur_kernel = tk.IntVar(value=81)
@@ -259,18 +115,18 @@ class DetectionControlPanel:
         ttk.Button(input_row, text="摄像头", command=self._use_camera).pack(
             side=tk.RIGHT, padx=(0, 5)
         )
-        ttk.Button(input_row, text="屏幕", command=self._use_screen, width=6).pack(
-            side=tk.RIGHT, padx=(0, 5)
-        )
 
         # 输出视频
         output_row = ttk.Frame(parent)
         output_row.pack(fill=tk.X, pady=(0, 5))
-        ttk.Label(output_row, text="输出视频:", width=10).pack(side=tk.LEFT)
+        ttk.Label(output_row, text="输出路径:", width=10).pack(side=tk.LEFT)
         self.output_entry = ttk.Entry(output_row, textvariable=self._output_path)
         self.output_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 5))
-        ttk.Button(output_row, text="浏览...", command=self._browse_output).pack(
+        ttk.Button(output_row, text="文件...", command=self._browse_output).pack(
             side=tk.RIGHT
+        )
+        ttk.Button(output_row, text="目录...", command=self._browse_output_folder).pack(
+            side=tk.RIGHT, padx=(0, 5)
         )
 
         # 目标文件大小
@@ -290,21 +146,13 @@ class DetectionControlPanel:
         ttk.Radiobutton(model_row, text="NudeNet 320 (快速)", variable=self._nude_model, value="320").pack(side=tk.LEFT, padx=(0, 10))
         ttk.Radiobutton(model_row, text="NudeNet 640 (精确)", variable=self._nude_model, value="640m").pack(side=tk.LEFT)
 
-        # 预览开关
+        # 720P缩放开关
         self._show_preview = tk.BooleanVar(value=True)
         ttk.Checkbutton(
-            parent, text="显示预览窗口（关闭可加速）", variable=self._show_preview
-        ).pack(anchor="w", pady=(10, 0))
-
-        # 720p 加速开关
-        self._downscale_720p = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            parent, text="启用 720p 加速（降低分辨率加快处理）", variable=self._downscale_720p
+            parent, text="720P缩放处理（加速）", variable=self._resize_720p
         ).pack(anchor="w", pady=(5, 0))
-
-        # 调试开关
         ttk.Checkbutton(
-            parent, text="保存调试图片", variable=self._debug_enabled
+            parent, text="显示预览窗口（关闭可加速）", variable=self._show_preview
         ).pack(anchor="w", pady=(5, 0))
 
     def _build_censor_tab(self, parent):
@@ -485,37 +333,28 @@ class DetectionControlPanel:
             self._output_path.set(folder)
 
     def _browse_output(self):
-        """选择输出路径"""
-        current_output = self._output_path.get().strip()
-        if os.path.isdir(current_output):
-            folder = filedialog.askdirectory(
-                title="选择输出文件夹",
-                initialdir=current_output,
-            )
-            if folder:
-                self._output_path.set(folder)
-        else:
-            filetypes = (("MP4 视频", "*.mp4"), ("所有文件", "*.*"))
-            filename = filedialog.asksaveasfilename(
-                title="保存输出视频",
-                filetypes=filetypes,
-                defaultextension=".mp4",
-                initialdir=current_output if os.path.isdir(current_output) else ".",
-            )
-            if filename:
-                self._output_path.set(filename)
+        """选择输出文件路径"""
+        filetypes = (("MP4 视频", "*.mp4"), ("所有文件", "*.*"))
+        filename = filedialog.asksaveasfilename(
+            title="保存输出视频",
+            filetypes=filetypes,
+            defaultextension=".mp4",
+            initialdir=".",
+        )
+        if filename:
+            self._output_path.set(filename)
+
+    def _browse_output_folder(self):
+        """选择输出目录"""
+        folder = filedialog.askdirectory(title="选择输出目录", initialdir=".")
+        if folder:
+            self._output_path.set(folder)
 
     def _use_camera(self):
         """使用摄像头"""
         self._video_path.set("0")
         self._video_paths = [0]
         self._output_path.set("camera_output.mp4")
-
-    def _use_screen(self):
-        """使用屏幕捕获"""
-        self._video_path.set("screen")
-        self._video_paths = ["screen"]
-        self._output_path.set("screen_output.mp4")
 
     # ========== 模式切换 ==========
 
@@ -526,7 +365,6 @@ class DetectionControlPanel:
             self.pixel_frame,
             self.distortion_frame,
             self.buffer_frame,
-            self.genitalia_buffer_frame,
         ]:
             frame.pack_forget()
 
@@ -540,7 +378,6 @@ class DetectionControlPanel:
 
         # 缓冲帧数始终显示
         self.buffer_frame.pack(fill=tk.X, pady=5)
-        self.genitalia_buffer_frame.pack(fill=tk.X, pady=5)
 
     # ========== 选择方法 ==========
 
@@ -651,17 +488,14 @@ class DetectionControlPanel:
     def get_preview(self):
         return self._show_preview.get()
 
-    def get_debug_enabled(self):
-        return self._debug_enabled.get()
-
-    def get_downscale_720p(self):
-        return self._downscale_720p.get()
+    def get_target_size_mb(self):
+        return self._target_size_mb.get()
 
     def get_nude_model(self):
         return self._nude_model.get()
 
-    def get_target_size_mb(self):
-        return self._target_size_mb.get()
+    def get_resize_720p(self):
+        return self._resize_720p.get()
 
     # ========== 生命周期 ==========
 
@@ -815,11 +649,12 @@ class RealtimeCascadeDetector:
 
         self.nude_imgsz = {"320": (320, 192), "640m": (640, 384)}
 
+        # ============== 可调参数 ==============
         # 私密部位 padding（横向、纵向放大系数）
-        self.GENITALIA_PAD_X = 4.0
-        self.GENITALIA_PAD_Y = 1.6
+        self.GENITALIA_PAD_X = 4.0   # 横向放大倍数
+        self.GENITALIA_PAD_Y = 1.6   # 纵向放大倍数
+        # ====================================
 
-        # NudeNet 标签映射
         self.nudenet_labels = [
             "FEMALE_GENITALIA_COVERED",
             "FACE_FEMALE",
@@ -848,7 +683,6 @@ class RealtimeCascadeDetector:
             "MALE_BREAST_EXPOSED",
             "ANUS_EXPOSED",
             "MALE_GENITALIA_EXPOSED",
-            "eye",
         ]
         self.female_sensitive_labels = [
             "FEMALE_GENITALIA_COVERED",
@@ -862,15 +696,12 @@ class RealtimeCascadeDetector:
             "BUTTOCKS_COVERED",
             "eye",
         ]
-        # 新增：控制面板（延迟初始化，避免影响模型加载）
-        self.control_panel = None
-
-        # 遮蔽缓冲区：保存最近 N 帧的检测结果（延迟初始化为列表）
-        self.censor_buffer = None
-        self.genitalia_censor_buffer = None
-        self.buffer_frames = 5  # 缓冲帧数
-        # 检查 ffmpeg 是否可用
+        self.censor_buffer = []
+        self.genitalia_censor_buffer = []
         self.has_ffmpeg = self._check_ffmpeg()
+    def get_nude_model_and_imgsz(self):
+        model_key = self.control_panel.get_nude_model() if self.control_panel else "640m"
+        return self.precise_models[model_key], self.nude_imgsz[model_key]
 
     @staticmethod
     def _check_ffmpeg():
@@ -886,10 +717,6 @@ class RealtimeCascadeDetector:
         if 0 <= class_id < len(self.nudenet_labels):
             return self.nudenet_labels[class_id]
         return f"UNKNOWN_{class_id}"
-
-    def get_nude_model_and_imgsz(self):
-        model_key = self.control_panel.get_nude_model() if self.control_panel else "640m"
-        return self.precise_models[model_key], self.nude_imgsz[model_key]
 
     def _merge_breast_boxes(self, breast_detections):
         """
@@ -933,7 +760,7 @@ class RealtimeCascadeDetector:
         eye_detections 是同一 face_idx 的眼睛列表
         """
         eye_padding_x_ratio = 0.3
-        eye_padding_y_ratio = 0.3
+        eye_padding_y_ratio = 0.15
         if len(eye_detections) == 0:
             return []
         if len(eye_detections) == 1:
@@ -984,63 +811,45 @@ class RealtimeCascadeDetector:
         buffer_frames = self.control_panel.get_buffer_frames()
         genitalia_buffer_frames = self.control_panel.get_genitalia_buffer_frames()
 
+        genitalia_labels = ["FEMALE_GENITALIA_EXPOSED", "FEMALE_GENITALIA_COVERED"]
+
         breast_labels = [
             "FEMALE_BREAST_EXPOSED",
             "FEMALE_BREAST_COVERED",
             "MALE_BREAST_EXPOSED",
         ]
-        genitalia_labels = [
-            "FEMALE_GENITALIA_EXPOSED",
-            "FEMALE_GENITALIA_COVERED",
-        ]
 
         breast_detections = []
-        genitalia_detections = []
         eye_detections = []
+        genitalia_detections = []
         other_detections = []
 
         for det in detections:
             if det["class_name"] in breast_labels:
                 breast_detections.append(det)
+            elif det["class_name"] == "eye" and "face_idx" in det:
+                eye_detections.append(det)
             elif det["class_name"] in genitalia_labels:
                 genitalia_detections.append(det)
-            elif det["class_name"] == "eye":
-                eye_detections.append(det)
             else:
                 other_detections.append(det)
 
-        person_breast_map = {}
-        for det in breast_detections:
-            pid = det.pop("person_idx", None)
-            if pid not in person_breast_map:
-                person_breast_map[pid] = []
-            person_breast_map[pid].append(det)
+        merged_breast = self._merge_breast_boxes(breast_detections)
 
-        person_eye_map = {}
-        for det in eye_detections:
-            pid = det.pop("person_idx", None)
-            if pid not in person_eye_map:
-                person_eye_map[pid] = []
-            person_eye_map[pid].append(det)
-
-        merged_breast = []
-        for pid, breasts in person_breast_map.items():
-            merged_breast.extend(self._merge_breast_boxes(breasts))
-
-        merged_genitalia = list(genitalia_detections)
+        face_eye_map = {}
+        for eye_det in eye_detections:
+            face_idx = eye_det.pop("face_idx")
+            if face_idx not in face_eye_map:
+                face_eye_map[face_idx] = []
+            face_eye_map[face_idx].append(eye_det)
 
         merged_eyes = []
-        for pid, eyes in person_eye_map.items():
+        for face_idx, eyes in face_eye_map.items():
             merged_eyes.extend(self._merge_eye_boxes(eyes))
 
         current_detections = merged_breast + merged_eyes + other_detections
 
         # ========== 缓冲区递减 & 清理 ==========
-        if self.censor_buffer is None:
-            self.censor_buffer = []
-        if self.genitalia_censor_buffer is None:
-            self.genitalia_censor_buffer = []
-
         new_buffer = []
         for remaining, dets in self.censor_buffer:
             remaining -= 1
@@ -1059,16 +868,22 @@ class RealtimeCascadeDetector:
         if buffer_frames > 0:
             self.censor_buffer.append((buffer_frames, current_detections))
         if genitalia_buffer_frames > 0:
-            self.genitalia_censor_buffer.append((genitalia_buffer_frames, merged_genitalia))
+            self.genitalia_censor_buffer.append((genitalia_buffer_frames, genitalia_detections))
 
         # ========== 收集所有需要遮蔽的框 ==========
         all_boxes = list(current_detections)
-        for remaining, dets in self.censor_buffer:
-            all_boxes.extend(dets)
-        for remaining, dets in self.genitalia_censor_buffer:
-            all_boxes.extend(dets)
 
-        # 第二步：对所有检测进行遮蔽
+        # 常规检测缓冲（追加历史帧）
+        if buffer_frames > 0:
+            for remaining, dets in self.censor_buffer:
+                all_boxes.extend(dets)
+
+        # 私密部位缓冲（追加历史帧）
+        if genitalia_buffer_frames > 0:
+            for remaining, dets in self.genitalia_censor_buffer:
+                all_boxes.extend(dets)
+
+        # ========== 对所有检测进行遮蔽 ==========
         for det in all_boxes:
             if self.control_panel is not None and not self.control_panel.should_draw(
                 det["class_name"]
@@ -1093,123 +908,17 @@ class RealtimeCascadeDetector:
 
         return frame
 
-    def _annotate_frame(self, frame):
-        """对单帧进行检测和遮蔽（用于屏幕捕获模式）"""
-        height, width = frame.shape[:2]
+        # ========== 缓冲区递减 & 清理 ==========
 
-        results_fast = self.fast_model(frame, conf=0.3, classes=[0])
-        candidates = []
-        for box in results_fast[0].boxes:
-            x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
-            pad = 50
-            x1 = max(0, x1 - pad)
-            y1 = max(0, y1 - pad)
-            x2 = min(width, x2 + pad)
-            y2 = min(height, y2 + pad)
-            candidates.append((x1, y1, x2, y2))
+        # ========== 更新缓冲区：减少剩余帧数，移除过期条目 ==========
+        new_buffer = []
+        for remaining, dets in self.censor_buffer:
+            remaining -= 1
+            if remaining > 0:
+                new_buffer.append((remaining, dets))
+        self.censor_buffer = new_buffer
 
-        final_detections = []
-        face_rois = {}
-
-        person_rois = []
-        person_indices = []
-        person_roi_data = []
-        for idx, (x1, y1, x2, y2) in enumerate(candidates):
-            roi = frame[y1:y2, x1:x2]
-            if roi.size == 0:
-                continue
-            person_rois.append(roi)
-            person_indices.append(idx)
-            person_roi_data.append((idx, x1, y1))
-
-        precise_model, nude_imgsz = self.get_nude_model_and_imgsz()
-
-        BATCH_SIZE = 2
-        if person_rois:
-            for batch_start in range(0, len(person_rois), BATCH_SIZE):
-                batch_end = min(batch_start + BATCH_SIZE, len(person_rois))
-                batch_rois = person_rois[batch_start:batch_end]
-                batch_indices = person_indices[batch_start:batch_end]
-                batch_roi_data = person_roi_data[batch_start:batch_end]
-
-                precise_results = precise_model(batch_rois, conf=0.2, imgsz=nude_imgsz, rect=False)
-
-                for i, res in enumerate(precise_results):
-                    person_idx = batch_indices[i]
-                    idx, x1, y1 = batch_roi_data[i]
-
-                    for pr in res.boxes:
-                        rx1, ry1, rx2, ry2 = map(int, pr.xyxy[0].tolist())
-                        conf = float(pr.conf[0])
-                        cls = int(pr.cls[0])
-                        label_name = self.get_label_name(cls)
-
-                        bx1, by1, bx2, by2 = x1 + rx1, y1 + ry1, x1 + rx2, y1 + ry2
-
-                        if label_name in ("FEMALE_GENITALIA_EXPOSED", "FEMALE_GENITALIA_COVERED"):
-                            w, h = bx2 - bx1, by2 - by1
-                            cx, cy = (bx1 + bx2) // 2, (by1 + by2) // 2
-                            new_w, new_h = int(w * self.GENITALIA_PAD_X), int(h * self.GENITALIA_PAD_Y)
-                            bx1, by1 = cx - new_w // 2, cy - new_h // 2
-                            bx2, by2 = cx + new_w // 2, cy + new_h // 2
-
-                        final_detections.append(
-                            {
-                                "bbox": (bx1, by1, bx2, by2),
-                                "class": cls,
-                                "class_name": label_name,
-                                "confidence": conf,
-                                "is_sensitive": label_name in self.sensitive_labels,
-                                "is_female": label_name in self.female_sensitive_labels,
-                                "person_idx": person_idx,
-                            }
-                        )
-
-                        if label_name in ("FACE_FEMALE", "FACE_MALE"):
-                            face_rois[person_idx] = (x1 + rx1, y1 + ry1, x1 + rx2, y1 + ry2)
-
-        if face_rois:
-            face_roi_list = []
-            face_idx_list = []
-            face_roi_coords = {}
-            for person_idx, (fx1, fy1, fx2, fy2) in face_rois.items():
-                face_roi = frame[fy1:fy2, fx1:fx2]
-                if face_roi.size == 0:
-                    continue
-                face_roi_list.append(face_roi)
-                face_idx_list.append(person_idx)
-                face_roi_coords[person_idx] = (fx1, fy1)
-
-            if face_roi_list:
-                for batch_start in range(0, len(face_roi_list), BATCH_SIZE):
-                    batch_end = min(batch_start + BATCH_SIZE, len(face_roi_list))
-                    batch_rois = face_roi_list[batch_start:batch_end]
-                    batch_indices = face_idx_list[batch_start:batch_end]
-
-                    eye_results = self.eye_model(batch_rois, conf=0.2, imgsz=320, rect=False)
-
-                    for i, res in enumerate(eye_results):
-                        person_idx = batch_indices[i]
-                        fx1, fy1 = face_roi_coords[person_idx]
-
-                        for er in res.boxes:
-                            cls_id = int(er.cls[0])
-                            label_name = self.eye_model.names[cls_id]
-
-                            ex1, ey1, ex2, ey2 = map(int, er.xyxy[0].tolist())
-                            final_detections.append(
-                                {
-                                    "bbox": (fx1 + ex1, fy1 + ey1, fx1 + ex2, fy1 + ey2),
-                                    "class": cls_id,
-                                    "class_name": label_name,
-                                    "confidence": float(er.conf[0]),
-                                    "is_sensitive": label_name in self.sensitive_labels,
-                                    "is_female": label_name in self.female_sensitive_labels,
-                                    "person_idx": person_idx,
-                                }
-                            )
-
-        return self.draw_results(frame, final_detections)
+        return frame
 
     def _merge_audio(self, video_source, temp_video, output_path):
         """用 ffmpeg 将原视频的音频合并到输出视频（视频流直接 copy）"""
@@ -1265,26 +974,27 @@ class RealtimeCascadeDetector:
         """处理单个视频，返回是否正常完成"""
         import time
 
-        reader = VideoReader(video_source, use_gpu=True)
-        if not reader.start():
+        if video_source == 0:
+            cap = cv2.VideoCapture(0)
+        else:
+            cap = cv2.VideoCapture(video_source)
+        if not cap.isOpened():
             print(f"无法打开视频源: {video_source}")
             return
 
-        fps = reader.get_fps()
-        total_frames = reader.get_frame_count()
-        orig_width = reader.get_width()
-        orig_height = reader.get_height()
-
-        # 720p 加速模式
-        downscale_720p = self.control_panel.get_downscale_720p()
-        if downscale_720p:
-            target_height = 720
-            target_width = int(orig_width * (target_height / orig_height))
-            target_width = (target_width // 2) * 2
-            target_height = (target_height // 2) * 2
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        orig_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        orig_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        use_720p = self.control_panel.get_resize_720p()
+        if use_720p:
+            scale = 720 / max(orig_height, orig_width)
+            width = int(orig_width * scale)
+            height = int(orig_height * scale)
+            width = width if width % 2 == 0 else width + 1
+            height = height if height % 2 == 0 else height + 1
         else:
-            target_width = orig_width
-            target_height = orig_height
+            width, height = orig_width, orig_height
 
         # 检查输入视频时长（用于码率计算）
         duration = 0
@@ -1319,7 +1029,7 @@ class RealtimeCascadeDetector:
             "-pix_fmt",
             "bgr24",
             "-s",
-            f"{target_width}x{target_height}",
+            f"{width}x{height}",
             "-r",
             str(fps),
             "-i",
@@ -1361,7 +1071,7 @@ class RealtimeCascadeDetector:
 
         os.makedirs("./debug_roi", exist_ok=True)
         frame_id = 0
-        self.censor_buffer = None  # 延迟初始化为列表
+        self.censor_buffer = []
 
         # FPS 计时
         fps_start_time = time.time()
@@ -1372,162 +1082,128 @@ class RealtimeCascadeDetector:
             if self.control_panel.is_stopped():
                 print("用户停止处理")
                 break
-            ret, frame = reader.read()
+            ret, frame = cap.read()
             if not ret:
                 break
 
-            # 720p 加速模式：缩小到 720p
-            if downscale_720p:
-                frame = cv2.resize(frame, (target_width, target_height), interpolation=cv2.INTER_LINEAR)
+            if use_720p:
+                frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_NEAREST)
 
             # ----------------- 第一阶段：检测人 -----------------
             results_fast = self.fast_model(frame, conf=0.3, classes=[0])
             candidates = []
+            h, w = frame.shape[:2]
             for box in results_fast[0].boxes:
                 x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
                 pad = 50
                 x1 = max(0, x1 - pad)
                 y1 = max(0, y1 - pad)
-                x2 = min(target_width, x2 + pad)
-                y2 = min(target_height, y2 + pad)
+                x2 = min(w, x2 + pad)
+                y2 = min(h, y2 + pad)
                 candidates.append((x1, y1, x2, y2))
 
-            # ----------------- 第二阶段：NudeNet 检测（批量分片）-----------------
-            precise_model, nude_imgsz = self.get_nude_model_and_imgsz()
+            # ----------------- 第二阶段：NudeNet 检测 -----------------
             final_detections = []
-            face_rois = {}
-
-            person_rois = []
-            person_indices = []
-            person_roi_data = []
+            face_rois = []
+            face_count = 0
+            precise_model, nude_imgsz = self.get_nude_model_and_imgsz()
             for idx, (x1, y1, x2, y2) in enumerate(candidates):
                 roi = frame[y1:y2, x1:x2]
                 if roi.size == 0:
                     continue
-                person_rois.append(roi)
-                person_indices.append(idx)
-                person_roi_data.append((idx, x1, y1))
 
-            BATCH_SIZE = 2
-            if person_rois:
-                for batch_start in range(0, len(person_rois), BATCH_SIZE):
-                    batch_end = min(batch_start + BATCH_SIZE, len(person_rois))
-                    batch_rois = person_rois[batch_start:batch_end]
-                    batch_indices = person_indices[batch_start:batch_end]
-                    batch_roi_data = person_roi_data[batch_start:batch_end]
+                precise_results = precise_model(roi, conf=0.15, imgsz=nude_imgsz)
 
-                    precise_results = precise_model(batch_rois, conf=0.2, imgsz=nude_imgsz, rect=False)
+                for pr in precise_results[0].boxes:
+                    rx1, ry1, rx2, ry2 = map(int, pr.xyxy[0].tolist())
+                    conf = float(pr.conf[0])
+                    cls = int(pr.cls[0])
+                    label_name = self.get_label_name(cls)
 
-                    for i, res in enumerate(precise_results):
-                        person_idx = batch_indices[i]
-                        idx, x1, y1 = batch_roi_data[i]
+                    bx1, by1, bx2, by2 = x1 + rx1, y1 + ry1, x1 + rx2, y1 + ry2
 
-                        for pr in res.boxes:
-                            rx1, ry1, rx2, ry2 = map(int, pr.xyxy[0].tolist())
-                            conf = float(pr.conf[0])
-                            cls = int(pr.cls[0])
-                            label_name = self.get_label_name(cls)
+                    if label_name in ("FEMALE_GENITALIA_EXPOSED", "FEMALE_GENITALIA_COVERED"):
+                        w, h = bx2 - bx1, by2 - by1
+                        cx, cy = (bx1 + bx2) // 2, (by1 + by2) // 2
+                        new_w, new_h = int(w * self.GENITALIA_PAD_X), int(h * self.GENITALIA_PAD_Y)
+                        bx1, by1 = cx - new_w // 2, cy - new_h // 2
+                        bx2, by2 = cx + new_w // 2, cy + new_h // 2
 
-                            bx1, by1, bx2, by2 = x1 + rx1, y1 + ry1, x1 + rx2, y1 + ry2
+                    final_detections.append(
+                        {
+                            "bbox": (bx1, by1, bx2, by2),
+                            "class": cls,
+                            "class_name": label_name,
+                            "confidence": conf,
+                            "is_sensitive": label_name in self.sensitive_labels,
+                            "is_female": label_name in self.female_sensitive_labels,
+                        }
+                    )
 
-                            if label_name in ("FEMALE_GENITALIA_EXPOSED", "FEMALE_GENITALIA_COVERED"):
-                                w, h = bx2 - bx1, by2 - by1
-                                cx, cy = (bx1 + bx2) // 2, (by1 + by2) // 2
-                                new_w, new_h = int(w * self.GENITALIA_PAD_X), int(h * self.GENITALIA_PAD_Y)
-                                bx1, by1 = cx - new_w // 2, cy - new_h // 2
-                                bx2, by2 = cx + new_w // 2, cy + new_h // 2
+                    if label_name in ("FACE_FEMALE", "FACE_MALE"):
+                        face_rois.append(
+                            (face_count, x1 + rx1, y1 + ry1, x1 + rx2, y1 + ry2)
+                        )
+                        face_count += 1
 
-                            final_detections.append(
-                                {
-                                    "bbox": (bx1, by1, bx2, by2),
-                                    "class": cls,
-                                    "class_name": label_name,
-                                    "confidence": conf,
-                                    "is_sensitive": label_name in self.sensitive_labels,
-                                    "is_female": label_name in self.female_sensitive_labels,
-                                    "person_idx": person_idx,
-                                }
+                # 调试保存（带检测框的 ROI）
+                if frame_id % 30 == 0:
+                    roi_annotated = roi.copy()
+                    for det in final_detections:
+                        gx1, gy1, gx2, gy2 = det["bbox"]
+                        if gx1 >= x1 and gy1 >= y1 and gx2 <= x2 and gy2 <= y2:
+                            rx1 = gx1 - x1
+                            ry1 = gy1 - y1
+                            rx2 = gx2 - x1
+                            ry2 = gy2 - y1
+                            color = (
+                                (0, 0, 255) if det["is_sensitive"] else (0, 255, 255)
                             )
-
-                            if label_name in ("FACE_FEMALE", "FACE_MALE"):
-                                face_rois[person_idx] = (x1 + rx1, y1 + ry1, x1 + rx2, y1 + ry2)
-
-                        if self.control_panel.get_debug_enabled() and frame_id % 30 == 0:
-                            roi_annotated = batch_rois[i].copy()
-                            for det in final_detections:
-                                if det["person_idx"] == person_idx:
-                                    gx1, gy1, gx2, gy2 = det["bbox"]
-                                    rx1 = gx1 - x1
-                                    ry1 = gy1 - y1
-                                    rx2 = gx2 - x1
-                                    ry2 = gy2 - y1
-                                    color = (
-                                        (0, 0, 255) if det["is_sensitive"] else (0, 255, 255)
-                                    )
-                                    cv2.rectangle(
-                                        roi_annotated, (rx1, ry1), (rx2, ry2), color, 2
-                                    )
-                                    label = f"{det['class_name']}: {det['confidence']:.2f}"
-                                    cv2.putText(
-                                        roi_annotated,
-                                        label,
-                                        (rx1, ry1 - 5),
-                                        cv2.FONT_HERSHEY_SIMPLEX,
-                                        0.4,
-                                        color,
-                                        1,
-                                    )
-                            cv2.imwrite(
-                                f"./debug_roi/debug_roi_{frame_id}_{person_idx}.jpg", roi_annotated
+                            cv2.rectangle(
+                                roi_annotated, (rx1, ry1), (rx2, ry2), color, 2
                             )
+                            label = f"{det['class_name']}: {det['confidence']:.2f}"
+                            cv2.putText(
+                                roi_annotated,
+                                label,
+                                (rx1, ry1 - 5),
+                                cv2.FONT_HERSHEY_SIMPLEX,
+                                0.4,
+                                color,
+                                1,
+                            )
+                    cv2.imwrite(
+                        f"./debug_roi/debug_roi_{frame_id}_{idx}.jpg", roi_annotated
+                    )
 
-            # ----------------- 第三阶段：Eye 模型检测（批量分片）-----------------
-            if face_rois:
-                face_roi_list = []
-                face_idx_list = []
-                face_roi_coords = {}
-                for person_idx, (fx1, fy1, fx2, fy2) in face_rois.items():
-                    face_roi = frame[fy1:fy2, fx1:fx2]
-                    if face_roi.size == 0:
+            # ----------------- 第三阶段：Eye 模型检测 -----------------
+            for face_idx, fx1, fy1, fx2, fy2 in face_rois:
+                face_roi = frame[fy1:fy2, fx1:fx2]
+                if face_roi.size == 0:
+                    continue
+                eye_results = self.eye_model(face_roi, conf=0.25, imgsz=320)
+                for er in eye_results[0].boxes:
+                    cls_id = int(er.cls[0])
+                    label_name = self.eye_model.names[cls_id]
+                    if label_name != "eye":
                         continue
-                    face_roi_list.append(face_roi)
-                    face_idx_list.append(person_idx)
-                    face_roi_coords[person_idx] = (fx1, fy1)
-
-                if face_roi_list:
-                    for batch_start in range(0, len(face_roi_list), BATCH_SIZE):
-                        batch_end = min(batch_start + BATCH_SIZE, len(face_roi_list))
-                        batch_rois = face_roi_list[batch_start:batch_end]
-                        batch_indices = face_idx_list[batch_start:batch_end]
-
-                        eye_results = self.eye_model(batch_rois, conf=0.2, imgsz=320, rect=False)
-
-                        for i, res in enumerate(eye_results):
-                            person_idx = batch_indices[i]
-                            fx1, fy1 = face_roi_coords[person_idx]
-
-                            for er in res.boxes:
-                                cls_id = int(er.cls[0])
-                                label_name = self.eye_model.names[cls_id]
-                                if label_name != "eye":
-                                    continue
-                                er_x1, er_y1, er_x2, er_y2 = map(int, er.xyxy[0].tolist())
-                                final_detections.append(
-                                    {
-                                        "bbox": (
-                                            fx1 + er_x1,
-                                            fy1 + er_y1,
-                                            fx1 + er_x2,
-                                            fy1 + er_y2,
-                                        ),
-                                        "class": 999,
-                                        "class_name": "eye",
-                                        "confidence": float(er.conf[0]),
-                                        "is_sensitive": True,
-                                        "is_female": True,
-                                        "person_idx": person_idx,
-                                    }
-                                )
+                    er_x1, er_y1, er_x2, er_y2 = map(int, er.xyxy[0].tolist())
+                    final_detections.append(
+                        {
+                            "bbox": (
+                                fx1 + er_x1,
+                                fy1 + er_y1,
+                                fx1 + er_x2,
+                                fy1 + er_y2,
+                            ),
+                            "class": 999,
+                            "class_name": "eye",
+                            "confidence": float(er.conf[0]),
+                            "is_sensitive": True,
+                            "is_female": True,
+                            "face_idx": face_idx,
+                        }
+                    )
 
             # 绘制并写入 ffmpeg 管道
             annotated = self.draw_results(frame, final_detections)
@@ -1572,7 +1248,7 @@ class RealtimeCascadeDetector:
                 break
 
         # 最终统计
-        reader.stop()
+        cap.release()
         ffmpeg_proc.stdin.close()
         ffmpeg_proc.wait()
         if preview:
@@ -1605,57 +1281,6 @@ class RealtimeCascadeDetector:
         )
         return True
 
-    def _process_screen(self, output_path, preview):
-        """处理屏幕捕获，实时遮蔽显示器输出"""
-        from Screen_Censor import TransparentProtectionWindow
-        import time
-
-        screen_window = TransparentProtectionWindow()
-        if not screen_window.create_window():
-            print("无法创建保护窗口")
-            return False
-
-        screen_window.show_window()
-
-        width = screen_window.screen_width
-        height = screen_window.screen_height
-        fps = 30.0
-
-        self.control_panel.update_frame_count(0, 0)
-        frame_id = 0
-        fps_start_time = time.time()
-        fps_frame_count = 0
-        current_fps = 0.0
-
-        try:
-            while not self.control_panel.is_stopped():
-                frame = screen_window.capture_screen()
-                if frame is None:
-                    break
-
-                frame_id += 1
-                fps_frame_count += 1
-
-                if frame_id % 10 == 0:
-                    elapsed = time.time() - fps_start_time
-                    current_fps = fps_frame_count / elapsed if elapsed > 0 else 0
-                    self.control_panel.update_fps(current_fps)
-
-                annotated = self._annotate_frame(frame)
-
-                screen_window.update_display_content(annotated)
-
-                if not self.control_panel.update():
-                    break
-
-        finally:
-            screen_window.close()
-
-        self.control_panel.status_label.configure(
-            text="屏幕遮蔽已停止", foreground="blue"
-        )
-        return True
-
     def run(self):
         import time
 
@@ -1683,10 +1308,6 @@ class RealtimeCascadeDetector:
                 # 摄像头模式
                 self._process_video(0, "camera_output.mp4", preview)
                 success = True
-            elif video_sources == ["screen"]:
-                # 屏幕捕获模式
-                self._process_screen(output_base, preview)
-                success = True
             elif len(video_sources) == 1:
                 # 单文件
                 video_path = video_sources[0]
@@ -1700,10 +1321,14 @@ class RealtimeCascadeDetector:
                 success = True
             else:
                 # 多文件或文件夹
-                output_dir = output_base if os.path.isdir(output_base) else "."
                 for i, video_source in enumerate(video_sources):
+                    # 输出目录：优先使用output_base（如果是目录），否则用输入视频目录
+                    if output_base and os.path.isdir(output_base):
+                        out_dir = output_base
+                    else:
+                        out_dir = os.path.dirname(video_source) or "."
                     base_name = os.path.splitext(os.path.basename(video_source))[0]
-                    output_path = os.path.join(output_dir, f"{base_name}_censored.mp4")
+                    output_path = os.path.join(out_dir, f"{base_name}_censored.mp4")
 
                     if i > 0 and preview:
                         cv2.destroyAllWindows()
