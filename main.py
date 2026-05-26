@@ -10,6 +10,8 @@ import platform
 import queue
 import threading
 
+from Screen_Censor import TransparentProtectionWindow
+
 
 class VideoReader:
     def __init__(self, source, queue_size=4, use_gpu=False):
@@ -256,6 +258,9 @@ class DetectionControlPanel:
         ttk.Button(input_row, text="摄像头", command=self._use_camera).pack(
             side=tk.RIGHT, padx=(0, 5)
         )
+        ttk.Button(input_row, text="屏幕", command=self._use_screen, width=6).pack(
+            side=tk.RIGHT, padx=(0, 5)
+        )
 
         # 输出视频
         output_row = ttk.Frame(parent)
@@ -479,6 +484,12 @@ class DetectionControlPanel:
         self._video_path.set("0")
         self._video_paths = [0]
         self._output_path.set("camera_output.mp4")
+
+    def _use_screen(self):
+        """使用屏幕捕获"""
+        self._video_path.set("screen")
+        self._video_paths = ["screen"]
+        self._output_path.set("screen_output.mp4")
 
     # ========== 模式切换 ==========
 
@@ -1012,6 +1023,113 @@ class RealtimeCascadeDetector:
 
         return frame
 
+    def _annotate_frame(self, frame):
+        """对单帧进行检测和遮蔽（用于屏幕捕获模式）"""
+        height, width = frame.shape[:2]
+
+        results_fast = self.fast_model(frame, conf=0.3, classes=[0])
+        candidates = []
+        for box in results_fast[0].boxes:
+            x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+            pad = 50
+            x1 = max(0, x1 - pad)
+            y1 = max(0, y1 - pad)
+            x2 = min(width, x2 + pad)
+            y2 = min(height, y2 + pad)
+            candidates.append((x1, y1, x2, y2))
+
+        final_detections = []
+        face_rois = {}
+
+        person_rois = []
+        person_indices = []
+        person_roi_data = []
+        for idx, (x1, y1, x2, y2) in enumerate(candidates):
+            roi = frame[y1:y2, x1:x2]
+            if roi.size == 0:
+                continue
+            person_rois.append(roi)
+            person_indices.append(idx)
+            person_roi_data.append((idx, x1, y1))
+
+        BATCH_SIZE = 2
+        if person_rois:
+            for batch_start in range(0, len(person_rois), BATCH_SIZE):
+                batch_end = min(batch_start + BATCH_SIZE, len(person_rois))
+                batch_rois = person_rois[batch_start:batch_end]
+                batch_indices = person_indices[batch_start:batch_end]
+                batch_roi_data = person_roi_data[batch_start:batch_end]
+
+                precise_results = self.precise_model(batch_rois, conf=0.2, imgsz=(640, 384), rect=False)
+
+                for i, res in enumerate(precise_results):
+                    person_idx = batch_indices[i]
+                    idx, x1, y1 = batch_roi_data[i]
+
+                    for pr in res.boxes:
+                        rx1, ry1, rx2, ry2 = map(int, pr.xyxy[0].tolist())
+                        conf = float(pr.conf[0])
+                        cls = int(pr.cls[0])
+                        label_name = self.get_label_name(cls)
+
+                        final_detections.append(
+                            {
+                                "bbox": (x1 + rx1, y1 + ry1, x1 + rx2, y1 + ry2),
+                                "class": cls,
+                                "class_name": label_name,
+                                "confidence": conf,
+                                "is_sensitive": label_name in self.sensitive_labels,
+                                "is_female": label_name in self.female_sensitive_labels,
+                                "person_idx": person_idx,
+                            }
+                        )
+
+                        if label_name in ("FACE_FEMALE", "FACE_MALE"):
+                            face_rois[person_idx] = (x1 + rx1, y1 + ry1, x1 + rx2, y1 + ry2)
+
+        if face_rois:
+            face_roi_list = []
+            face_idx_list = []
+            face_roi_coords = {}
+            for person_idx, (fx1, fy1, fx2, fy2) in face_rois.items():
+                face_roi = frame[fy1:fy2, fx1:fx2]
+                if face_roi.size == 0:
+                    continue
+                face_roi_list.append(face_roi)
+                face_idx_list.append(person_idx)
+                face_roi_coords[person_idx] = (fx1, fy1)
+
+            if face_roi_list:
+                for batch_start in range(0, len(face_roi_list), BATCH_SIZE):
+                    batch_end = min(batch_start + BATCH_SIZE, len(face_roi_list))
+                    batch_rois = face_roi_list[batch_start:batch_end]
+                    batch_indices = face_idx_list[batch_start:batch_end]
+
+                    eye_results = self.eye_model(batch_rois, conf=0.2, imgsz=320, rect=False)
+
+                    for i, res in enumerate(eye_results):
+                        person_idx = batch_indices[i]
+                        fx1, fy1 = face_roi_coords[person_idx]
+
+                        for er in res.boxes:
+                            cls_id = int(er.cls[0])
+                            label_name = self.eye_model.names[cls_id]
+
+                            ex1, ey1, ex2, ey2 = map(int, er.xyxy[0].tolist())
+                            final_detections.append(
+                                {
+                                    "bbox": (fx1 + ex1, fy1 + ey1, fx1 + ex2, fy1 + ey2),
+                                    "class": cls_id,
+                                    "class_name": label_name,
+                                    "confidence": float(er.conf[0]),
+                                    "is_sensitive": label_name in self.sensitive_labels,
+                                    "is_female": label_name in self.female_sensitive_labels,
+                                    "person_idx": person_idx,
+                                }
+                            )
+
+        return self.draw_results(frame, final_detections)
+
     def _merge_audio(self, video_source, temp_video, output_path):
         """用 ffmpeg 将原视频的音频合并到输出视频（视频流直接 copy）"""
         try:
@@ -1396,6 +1514,57 @@ class RealtimeCascadeDetector:
         )
         return True
 
+    def _process_screen(self, output_path, preview):
+        """处理屏幕捕获，实时遮蔽显示器输出"""
+        from Screen_Censor import TransparentProtectionWindow
+        import time
+
+        screen_window = TransparentProtectionWindow()
+        if not screen_window.create_window():
+            print("无法创建保护窗口")
+            return False
+
+        screen_window.show_window()
+
+        width = screen_window.screen_width
+        height = screen_window.screen_height
+        fps = 30.0
+
+        self.control_panel.update_frame_count(0, 0)
+        frame_id = 0
+        fps_start_time = time.time()
+        fps_frame_count = 0
+        current_fps = 0.0
+
+        try:
+            while not self.control_panel.is_stopped():
+                frame = screen_window.capture_screen()
+                if frame is None:
+                    break
+
+                frame_id += 1
+                fps_frame_count += 1
+
+                if frame_id % 10 == 0:
+                    elapsed = time.time() - fps_start_time
+                    current_fps = fps_frame_count / elapsed if elapsed > 0 else 0
+                    self.control_panel.update_fps(current_fps)
+
+                annotated = self._annotate_frame(frame)
+
+                screen_window.update_display_content(annotated)
+
+                if not self.control_panel.update():
+                    break
+
+        finally:
+            screen_window.close()
+
+        self.control_panel.status_label.configure(
+            text="屏幕遮蔽已停止", foreground="blue"
+        )
+        return True
+
     def run(self):
         import time
 
@@ -1422,6 +1591,10 @@ class RealtimeCascadeDetector:
             if video_sources == [0]:
                 # 摄像头模式
                 self._process_video(0, "camera_output.mp4", preview)
+                success = True
+            elif video_sources == ["screen"]:
+                # 屏幕捕获模式
+                self._process_screen(output_base, preview)
                 success = True
             elif len(video_sources) == 1:
                 # 单文件
