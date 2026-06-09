@@ -192,7 +192,7 @@ class DetectionControlPanel:
 
         self._censor_mode = tk.StringVar(value="black")
         self._blur_kernel = tk.IntVar(value=81)
-        self._pixel_size = tk.IntVar(value=13)
+        self._pixel_size = tk.IntVar(value=10)
         self._distortion_strength = tk.IntVar(value=15)
         self._buffer_frames = tk.IntVar(value=5)
         self._genitalia_buffer_frames = tk.IntVar(value=10)
@@ -348,11 +348,11 @@ class DetectionControlPanel:
 
         # 像素化参数
         self.pixel_frame = ttk.Frame(self.params_frame)
-        ttk.Label(self.pixel_frame, text="像素块数量:").pack(side=tk.LEFT)
+        ttk.Label(self.pixel_frame, text="像素块尺寸:").pack(side=tk.LEFT)
         ttk.Scale(
             self.pixel_frame,
-            from_=5,
-            to=50,
+            from_=2,
+            to=30,
             variable=self._pixel_size,
             orient=tk.HORIZONTAL,
             length=200,
@@ -742,18 +742,15 @@ class CensorEffects:
 
     @staticmethod
     def pixelate(frame, x1, y1, x2, y2, pixel_size=10):
-        """像素化遮蔽（GUI 参数控制块数）"""
+        """像素化遮蔽（pixel_size 为像素块尺寸）"""
         roi = frame[y1:y2, x1:x2]
         if roi.size == 0:
             return frame
 
         h, w = roi.shape[:2]
 
-        # pixel_size 表示目标块数（沿短边），范围建议 5-50
-        blocks = max(3, pixel_size)
-
-        # 计算实际像素块大小
-        size = max(1, min(h, w) // blocks)
+        # pixel_size 表示像素块边长（像素），统一所有 ROI
+        size = max(2, pixel_size)
 
         # 缩小再放大
         small_w = max(1, w // size)
