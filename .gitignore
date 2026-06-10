@@ -40,6 +40,12 @@ uv.lock
 *.onnx
 *.engine
 *.weights
+# 保留项目使用的模型
+!models/*.mlpackage
+!models/nudenet_320n.pt
+!models/nudenet_640m.pt
+!models/yolo26n.pt
+!models/face-parts-yolov8n.pt
 
 # 临时文件
 temp_roi.jpg
