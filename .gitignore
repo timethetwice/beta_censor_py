@@ -40,6 +40,7 @@ uv.lock
 *.onnx
 *.engine
 *.weights
+
 # 保留项目使用的模型
 !models/*.mlpackage
 !models/nudenet_320n.pt
@@ -66,3 +67,7 @@ output.mp4
 result.mp4
 output_with_annotations.mp4
 result.jpg
+
+# ffmpeg
+ffmpeg.exe
+ffprobe.exe

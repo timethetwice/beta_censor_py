@@ -23,6 +23,83 @@ class VideoReader:
         self.ret = False
         self.frame = None
         self.use_gpu = use_gpu and source != 0
+        self.gpu_fallback_reason = None
+
+    @staticmethod
+    def _parse_fps(fps_text):
+        if not fps_text or fps_text == "0/0":
+            return 0.0
+        if "/" in fps_text:
+            num, den = fps_text.split("/", 1)
+            den_value = float(den)
+            if den_value == 0:
+                return 0.0
+            return float(num) / den_value
+        return float(fps_text)
+
+    def _probe_video_info(self):
+        try:
+            result = subprocess.run(
+                [
+                    "ffprobe",
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v:0",
+                    "-show_entries",
+                    "stream=codec_name,width,height,avg_frame_rate,nb_frames",
+                    "-show_entries",
+                    "format=duration",
+                    "-of",
+                    "default=noprint_wrappers=1:nokey=0",
+                    str(self.source),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except Exception:
+            return False
+
+        info = {}
+        for line in result.stdout.splitlines():
+            if "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            info[key.strip()] = value.strip()
+
+        self.codec_name = info.get("codec_name", "")
+        self.width = int(info.get("width", "0") or 0)
+        self.height = int(info.get("height", "0") or 0)
+        self.fps = self._parse_fps(info.get("avg_frame_rate", "0/0"))
+        duration = float(info.get("duration", "0") or 0)
+        nb_frames = info.get("nb_frames", "0")
+        if nb_frames.isdigit():
+            self.frame_count = int(nb_frames)
+        elif duration > 0 and self.fps > 0:
+            self.frame_count = int(duration * self.fps)
+        else:
+            self.frame_count = 0
+        return self.width > 0 and self.height > 0
+
+    def _start_cpu_capture(self):
+        if self.source == 0:
+            self.cap = cv2.VideoCapture(0)
+            if not self.cap.isOpened():
+                return False
+            return True
+
+        self.use_gpu = False
+        return self._probe_video_info()
+
+    def _fallback_to_cpu(self, reason, existing_cap=None):
+        self.gpu_fallback_reason = reason
+        print(f"GPU decode unavailable for this file, falling back to ffmpeg CPU decode: {reason}")
+        self.use_gpu = False
+        if existing_cap is not None:
+            self.cap = existing_cap
+            return self.cap.isOpened()
+        return self._start_cpu_capture()
 
     def _reader_loop(self):
         if self.use_gpu:
@@ -31,6 +108,10 @@ class VideoReader:
             self._cpu_reader_loop()
 
     def _cpu_reader_loop(self):
+        if self.source != 0:
+            self._ffmpeg_reader_loop()
+            return
+
         while self.running:
             if self.cap is None:
                 break
@@ -39,6 +120,40 @@ class VideoReader:
                 self.queue.put((None, None))
                 break
             self.queue.put((ret, frame.copy()))
+
+    def _ffmpeg_reader_loop(self, decoder=None):
+        cmd = ["ffmpeg"]
+        if decoder:
+            cmd.extend(["-c:v", decoder])
+        cmd.extend([
+            "-i",
+            str(self.source),
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "bgr24",
+            "-",
+        ])
+
+        try:
+            self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+            frame_size = self.width * self.height * 3
+            if frame_size <= 0:
+                raise ValueError(f"invalid frame size {self.width}x{self.height}")
+            while self.running:
+                raw = self.proc.stdout.read(frame_size)
+                if len(raw) < frame_size:
+                    break
+                frame = np.frombuffer(raw, dtype=np.uint8).reshape((self.height, self.width, 3)).copy()
+                self.queue.put((True, frame))
+        except Exception as e:
+            mode = "GPU" if decoder else "CPU"
+            print(f"{mode} decode error: {e}")
+        finally:
+            if self.proc:
+                self.proc.terminate()
+                self.proc = None
+            self.queue.put((False, None))
 
     def _get_cuvid_decoder(self, source):
         try:
@@ -55,52 +170,21 @@ class VideoReader:
             return "h264_cuvid"
 
     def _gpu_reader_loop(self):
-        import subprocess
         cuvid = self._get_cuvid_decoder(self.source)
-        cmd = [
-            "ffmpeg",
-            "-c:v", cuvid,
-            "-i", str(self.source),
-            "-f", "rawvideo",
-            "-pix_fmt", "bgr24",
-            "-"
-        ]
-        try:
-            self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-            frame_size = self.width * self.height * 3
-            while self.running:
-                raw = self.proc.stdout.read(frame_size)
-                if len(raw) < frame_size:
-                    break
-                frame = np.frombuffer(raw, dtype=np.uint8).reshape((self.height, self.width, 3)).copy()
-                self.queue.put((True, frame))
-            self.proc.terminate()
-        except Exception as e:
-            print(f"GPU decode error: {e}")
-        finally:
-            self.queue.put((False, None))
+        self._ffmpeg_reader_loop(decoder=cuvid)
 
     def start(self):
         if self.source == 0:
             self.use_gpu = False
-            self.cap = cv2.VideoCapture(0)
-            if not self.cap.isOpened():
+            if not self._start_cpu_capture():
                 return False
         elif self.use_gpu:
-            temp_cap = cv2.VideoCapture(self.source)
-            if not temp_cap.isOpened():
-                self.use_gpu = False
-                self.cap = temp_cap
-                if not self.cap.isOpened():
-                    return False
-            self.width = int(temp_cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-            self.height = int(temp_cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-            self.fps = temp_cap.get(cv2.CAP_PROP_FPS)
-            self.frame_count = int(temp_cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            temp_cap.release()
+            if not self._probe_video_info():
+                return self._fallback_to_cpu("ffprobe failed to read video dimensions")
+            if self.fps <= 0:
+                self.fps = 30.0
         else:
-            self.cap = cv2.VideoCapture(self.source)
-            if not self.cap.isOpened():
+            if not self._start_cpu_capture():
                 return False
 
         self.running = True
@@ -127,35 +211,39 @@ class VideoReader:
             self.cap = None
 
     def get_fps(self):
-        if self.use_gpu:
+        if self.use_gpu or self.cap is None:
             return getattr(self, 'fps', 30.0)
         if self.cap:
             return self.cap.get(cv2.CAP_PROP_FPS)
         return 30.0
 
     def get_frame_count(self):
-        if self.use_gpu:
+        if self.use_gpu or self.cap is None:
             return getattr(self, 'frame_count', 0)
         if self.cap:
             return int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
         return 0
 
     def get_width(self):
-        if self.use_gpu:
+        if self.use_gpu or self.cap is None:
             return getattr(self, 'width', 0)
         if self.cap:
             return int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         return 0
 
     def get_height(self):
-        if self.use_gpu:
+        if self.use_gpu or self.cap is None:
             return getattr(self, 'height', 0)
         if self.cap:
             return int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         return 0
 
     def is_opened(self):
-        return (self.cap is not None and self.cap.isOpened()) or self.proc is not None
+        return (
+            (self.cap is not None and self.cap.isOpened())
+            or self.proc is not None
+            or (self.source != 0 and getattr(self, 'width', 0) > 0 and getattr(self, 'height', 0) > 0)
+        )
 
 
 class DetectionControlPanel:
@@ -1210,6 +1298,10 @@ class RealtimeCascadeDetector:
 
     def _merge_audio(self, video_source, temp_video, output_path):
         """用 ffmpeg 将原视频的音频合并到输出视频（视频流直接 copy）"""
+        if not os.path.exists(temp_video):
+            print(f"音频合并跳过：未找到临时视频 {temp_video}")
+            return False
+
         try:
             probe_cmd = [
                 "ffprobe",
@@ -1228,7 +1320,7 @@ class RealtimeCascadeDetector:
             if "audio" not in result.stdout:
                 print("原视频没有音频轨道，跳过音频合并")
                 os.rename(temp_video, output_path)
-                return
+                return True
 
             merge_cmd = [
                 "ffmpeg",
@@ -1252,11 +1344,16 @@ class RealtimeCascadeDetector:
             print("正在合并音频...")
             subprocess.run(merge_cmd, capture_output=True, check=True)
             print(f"音频合并完成: {output_path}")
+            return True
 
         except subprocess.CalledProcessError as e:
             print(f"音频合并失败: {e.stderr.decode() if e.stderr else str(e)}")
-            os.rename(temp_video, output_path)
-            print(f"无声视频已保存为: {output_path}")
+            if os.path.exists(temp_video):
+                os.rename(temp_video, output_path)
+                print(f"无声视频已保存为: {output_path}")
+                return True
+            print("音频合并失败，且无声临时视频不存在")
+            return False
 
     def _process_video(self, video_source, output_path, preview):
         """处理单个视频，返回是否正常完成"""
@@ -1372,6 +1469,16 @@ class RealtimeCascadeDetector:
             ret, frame = reader.read()
             if not ret:
                 break
+
+            if (
+                frame is None
+                or frame.size == 0
+                or len(frame.shape) < 2
+                or frame.shape[0] == 0
+                or frame.shape[1] == 0
+            ):
+                print("跳过空帧，避免触发模型预处理错误")
+                continue
 
             # 720p 加速模式：缩小到 720p
             if downscale_720p:
@@ -1575,6 +1682,13 @@ class RealtimeCascadeDetector:
         if preview:
             cv2.destroyAllWindows()
 
+        if not os.path.exists(temp_output):
+            self.control_panel.status_label.configure(
+                text="处理失败：输出视频未生成", foreground="red"
+            )
+            print(f"输出失败：未生成临时视频 {temp_output}")
+            return False
+
         stopped = self.control_panel.is_stopped()
 
         if stopped:
@@ -1590,9 +1704,14 @@ class RealtimeCascadeDetector:
 
         # 合并音频（视频已是 H.264，直接 copy，不重编码）
         if self.has_ffmpeg and video_source != 0:
-            self._merge_audio(video_source, temp_output, output_path)
+            merged = self._merge_audio(video_source, temp_output, output_path)
             if os.path.exists(temp_output):
                 os.remove(temp_output)
+            if not merged:
+                self.control_panel.status_label.configure(
+                    text="处理失败：音频合并或输出生成失败", foreground="red"
+                )
+                return False
         else:
             os.rename(temp_output, output_path)
 
