@@ -291,6 +291,7 @@ class DetectionControlPanel:
         self._output_path = tk.StringVar(value="output_censored.mp4")
         self._target_size_mb = tk.DoubleVar(value=0)
         self._nude_model = tk.StringVar(value="640m")
+        self._detector_mode = tk.StringVar(value="nudenet")
 
         self._censor_mode = tk.StringVar(value="black")
         self._blur_kernel = tk.IntVar(value=81)
@@ -391,6 +392,16 @@ class DetectionControlPanel:
         ttk.Label(model_row, text="检测模型:", width=10).pack(side=tk.LEFT)
         ttk.Radiobutton(model_row, text="NudeNet 320 (快速)", variable=self._nude_model, value="320").pack(side=tk.LEFT, padx=(0, 10))
         ttk.Radiobutton(model_row, text="NudeNet 640 (精确)", variable=self._nude_model, value="640m").pack(side=tk.LEFT)
+
+        detector_row = ttk.Frame(parent)
+        detector_row.pack(fill=tk.X, pady=(5, 0))
+        ttk.Label(detector_row, text="检测方式:", width=10).pack(side=tk.LEFT)
+        ttk.Radiobutton(
+            detector_row, text="NudeNet", variable=self._detector_mode, value="nudenet"
+        ).pack(side=tk.LEFT, padx=(0, 10))
+        ttk.Radiobutton(
+            detector_row, text="Pose", variable=self._detector_mode, value="pose"
+        ).pack(side=tk.LEFT)
 
         # 预览开关
         self._show_preview = tk.BooleanVar(value=True)
@@ -707,6 +718,8 @@ class DetectionControlPanel:
     def should_draw(self, class_name):
         if not self._running:
             return False
+        if self.get_detector_mode() == "pose":
+            return self._should_draw_pose_label(class_name)
         if class_name in self._label_vars:
             enabled = self._label_vars[class_name].get()
             if class_name in ("FACE_FEMALE", "FACE_MALE") and enabled:
@@ -762,8 +775,62 @@ class DetectionControlPanel:
     def get_nude_model(self):
         return self._nude_model.get()
 
+    def get_detector_mode(self):
+        return self._detector_mode.get()
+
     def get_target_size_mb(self):
         return self._target_size_mb.get()
+
+    def _should_draw_pose_label(self, class_name):
+        pose_aliases = {
+            "FACE_FEMALE": ["FACE_FEMALE", "FACE_MALE"],
+            "FACE_MALE": ["FACE_FEMALE", "FACE_MALE"],
+            "eye": ["eye"],
+            "FEMALE_BREAST_COVERED": [
+                "FEMALE_BREAST_EXPOSED",
+                "FEMALE_BREAST_COVERED",
+                "MALE_BREAST_EXPOSED",
+            ],
+            "FEMALE_BREAST_EXPOSED": [
+                "FEMALE_BREAST_EXPOSED",
+                "FEMALE_BREAST_COVERED",
+                "MALE_BREAST_EXPOSED",
+            ],
+            "MALE_BREAST_EXPOSED": [
+                "FEMALE_BREAST_EXPOSED",
+                "FEMALE_BREAST_COVERED",
+                "MALE_BREAST_EXPOSED",
+            ],
+            "BELLY_COVERED": ["BELLY_EXPOSED", "BELLY_COVERED"],
+            "BELLY_EXPOSED": ["BELLY_EXPOSED", "BELLY_COVERED"],
+            "FEMALE_GENITALIA_COVERED": [
+                "FEMALE_GENITALIA_EXPOSED",
+                "FEMALE_GENITALIA_COVERED",
+                "MALE_GENITALIA_EXPOSED",
+            ],
+            "FEMALE_GENITALIA_EXPOSED": [
+                "FEMALE_GENITALIA_EXPOSED",
+                "FEMALE_GENITALIA_COVERED",
+                "MALE_GENITALIA_EXPOSED",
+            ],
+            "MALE_GENITALIA_EXPOSED": [
+                "FEMALE_GENITALIA_EXPOSED",
+                "FEMALE_GENITALIA_COVERED",
+                "MALE_GENITALIA_EXPOSED",
+            ],
+            "BUTTOCKS_COVERED": ["BUTTOCKS_EXPOSED", "BUTTOCKS_COVERED"],
+            "BUTTOCKS_EXPOSED": ["BUTTOCKS_EXPOSED", "BUTTOCKS_COVERED"],
+            "FEET_COVERED": ["FEET_EXPOSED", "FEET_COVERED"],
+            "FEET_EXPOSED": ["FEET_EXPOSED", "FEET_COVERED"],
+        }
+
+        labels = pose_aliases.get(class_name, [class_name])
+        enabled = any(self._label_vars.get(label) and self._label_vars[label].get() for label in labels)
+        if enabled and class_name in ("FACE_FEMALE", "FACE_MALE"):
+            eye_enabled = self._label_vars.get("eye", None)
+            if eye_enabled and eye_enabled.get():
+                return False
+        return enabled
 
     # ========== 生命周期 ==========
 
@@ -898,6 +965,7 @@ class RealtimeCascadeDetector:
             self.fast_model = YOLO(
                 fast_model or "models/yolo26n.mlpackage", task="detect"
             )
+            self.pose_model = YOLO("models/yolo26n-pose.mlpackage", task="pose")
             self.precise_models = {
                 "320": YOLO("models/nudenet_320n.mlpackage", task="detect"),
                 "640m": YOLO("models/nudenet_640m.mlpackage", task="detect"),
@@ -906,6 +974,7 @@ class RealtimeCascadeDetector:
         else:  # Windows
             self.device = "cuda"
             self.fast_model = YOLO(fast_model or "models/yolo26n.engine", task="detect")
+            self.pose_model = YOLO("models/yolo26n-pose.pt", task="pose")
             self.precise_models = {
                 "320": YOLO("models/nudenet_320n.engine", task="detect"),
                 "640m": YOLO("models/nudenet_640m.engine", task="detect"),
@@ -913,6 +982,26 @@ class RealtimeCascadeDetector:
             self.eye_model = YOLO("models/face-parts-yolov8n.engine", task="detect")
 
         self.nude_imgsz = {"320": (320, 192), "640m": (640, 384)}
+        self.pose_imgsz = 640
+        self.pose_keypoints = {
+            "nose": 0,
+            "left_eye": 1,
+            "right_eye": 2,
+            "left_ear": 3,
+            "right_ear": 4,
+            "left_shoulder": 5,
+            "right_shoulder": 6,
+            "left_elbow": 7,
+            "right_elbow": 8,
+            "left_wrist": 9,
+            "right_wrist": 10,
+            "left_hip": 11,
+            "right_hip": 12,
+            "left_knee": 13,
+            "right_knee": 14,
+            "left_ankle": 15,
+            "right_ankle": 16,
+        }
 
         # 私密部位 padding（横向、纵向放大系数）
         self.GENITALIA_PAD_X = 4.0
@@ -996,6 +1085,284 @@ class RealtimeCascadeDetector:
     def get_nude_model_and_imgsz(self):
         model_key = self.control_panel.get_nude_model() if self.control_panel else "640m"
         return self.precise_models[model_key], self.nude_imgsz[model_key]
+
+    @staticmethod
+    def _clamp_bbox(x1, y1, x2, y2, width, height):
+        x1 = max(0, min(width - 1, int(x1)))
+        y1 = max(0, min(height - 1, int(y1)))
+        x2 = max(0, min(width, int(x2)))
+        y2 = max(0, min(height, int(y2)))
+        if x2 <= x1 or y2 <= y1:
+            return None
+        return (x1, y1, x2, y2)
+
+    @staticmethod
+    def _bbox_from_center(center_x, center_y, box_width, box_height, frame_width, frame_height):
+        return RealtimeCascadeDetector._clamp_bbox(
+            center_x - box_width / 2,
+            center_y - box_height / 2,
+            center_x + box_width / 2,
+            center_y + box_height / 2,
+            frame_width,
+            frame_height,
+        )
+
+    @staticmethod
+    def _point_distance(point_a, point_b):
+        return float(np.linalg.norm(np.array(point_a) - np.array(point_b)))
+
+    def _extract_pose_points(self, keypoints_xy, keypoints_conf):
+        points = {}
+        if keypoints_xy is None:
+            return points
+
+        for name, index in self.pose_keypoints.items():
+            if index >= len(keypoints_xy):
+                continue
+            confidence = 1.0
+            if keypoints_conf is not None and index < len(keypoints_conf):
+                confidence = float(keypoints_conf[index])
+            if confidence < 0.2:
+                continue
+            x_coord, y_coord = keypoints_xy[index]
+            points[name] = (float(x_coord), float(y_coord), confidence)
+        return points
+
+    @staticmethod
+    def _midpoint(point_a, point_b):
+        return ((point_a[0] + point_b[0]) / 2.0, (point_a[1] + point_b[1]) / 2.0)
+
+    def _point_xy(self, points, name):
+        point = points.get(name)
+        if point is None:
+            return None
+        return (point[0], point[1])
+
+    def _build_pose_face_bbox(self, points, frame_width, frame_height):
+        face_points = [
+            self._point_xy(points, "nose"),
+            self._point_xy(points, "left_eye"),
+            self._point_xy(points, "right_eye"),
+            self._point_xy(points, "left_ear"),
+            self._point_xy(points, "right_ear"),
+        ]
+        face_points = [point for point in face_points if point is not None]
+        if len(face_points) < 3:
+            return None
+
+        xs = [point[0] for point in face_points]
+        ys = [point[1] for point in face_points]
+        width = max(xs) - min(xs)
+        height = max(ys) - min(ys)
+        width = max(width, height * 0.9, 24)
+        height = max(height * 1.6, width * 0.9, 24)
+        center_x = (min(xs) + max(xs)) / 2.0
+        center_y = (min(ys) + max(ys)) / 2.0 + height * 0.05
+        return self._bbox_from_center(center_x, center_y, width * 1.35, height, frame_width, frame_height)
+
+    def _build_pose_eye_bbox(self, points, frame_width, frame_height):
+        left_eye = self._point_xy(points, "left_eye")
+        right_eye = self._point_xy(points, "right_eye")
+        if left_eye is None and right_eye is None:
+            return None
+
+        available = [point for point in [left_eye, right_eye] if point is not None]
+        center_x = sum(point[0] for point in available) / len(available)
+        center_y = sum(point[1] for point in available) / len(available)
+
+        if left_eye is not None and right_eye is not None:
+            eye_distance = self._point_distance(left_eye, right_eye)
+        else:
+            face_bbox = self._build_pose_face_bbox(points, frame_width, frame_height)
+            if face_bbox is None:
+                eye_distance = 30
+            else:
+                eye_distance = (face_bbox[2] - face_bbox[0]) * 0.35
+
+        return self._bbox_from_center(
+            center_x,
+            center_y,
+            max(eye_distance * 1.6, 30),
+            max(eye_distance * 0.3, 5),
+            frame_width,
+            frame_height,
+        )
+
+    def _build_pose_torso_metrics(self, points):
+        left_shoulder = self._point_xy(points, "left_shoulder")
+        right_shoulder = self._point_xy(points, "right_shoulder")
+        left_hip = self._point_xy(points, "left_hip")
+        right_hip = self._point_xy(points, "right_hip")
+
+        if not all([left_shoulder, right_shoulder, left_hip, right_hip]):
+            return None
+
+        shoulder_mid = self._midpoint(left_shoulder, right_shoulder)
+        hip_mid = self._midpoint(left_hip, right_hip)
+        shoulder_width = self._point_distance(left_shoulder, right_shoulder)
+        hip_width = self._point_distance(left_hip, right_hip)
+        torso_height = max(abs(hip_mid[1] - shoulder_mid[1]), shoulder_width * 0.7, 40)
+        return {
+            "left_shoulder": left_shoulder,
+            "right_shoulder": right_shoulder,
+            "left_hip": left_hip,
+            "right_hip": right_hip,
+            "shoulder_mid": shoulder_mid,
+            "hip_mid": hip_mid,
+            "shoulder_width": shoulder_width,
+            "hip_width": hip_width,
+            "torso_height": torso_height,
+        }
+
+    def _build_pose_breast_bbox(self, points, frame_width, frame_height):
+        torso = self._build_pose_torso_metrics(points)
+        if torso is None:
+            return None
+
+        center_y = torso["shoulder_mid"][1] + torso["torso_height"] * 0.28
+        center_x = (torso["left_shoulder"][0] + torso["right_shoulder"][0]) / 2.0
+        box_width = max(torso["shoulder_width"] * 1.4, 34)
+        box_height = max(torso["torso_height"] * 0.32, 28)
+        return self._bbox_from_center(center_x, center_y, box_width, box_height, frame_width, frame_height)
+
+    def _build_pose_belly_bbox(self, points, frame_width, frame_height):
+        torso = self._build_pose_torso_metrics(points)
+        if torso is None:
+            return None
+
+        center_x = torso["hip_mid"][0]
+        center_y = torso["shoulder_mid"][1] + torso["torso_height"] * 0.62
+        box_width = max(max(torso["shoulder_width"], torso["hip_width"]) * 0.72, 40)
+        box_height = max(torso["torso_height"] * 0.32, 30)
+        return self._bbox_from_center(center_x, center_y, box_width, box_height, frame_width, frame_height)
+
+    def _build_pose_genitalia_bbox(self, points, frame_width, frame_height):
+        torso = self._build_pose_torso_metrics(points)
+        if torso is None:
+            return None
+
+        center_x = torso["hip_mid"][0]
+        center_y = torso["hip_mid"][1] + torso["torso_height"] * 0.14
+        box_width = max(torso["hip_width"] * 2, 30)
+        box_height = max(torso["torso_height"] * 0.22, 26)
+        return self._bbox_from_center(center_x, center_y, box_width, box_height, frame_width, frame_height)
+
+    def _build_pose_buttocks_bbox(self, points, frame_width, frame_height):
+        torso = self._build_pose_torso_metrics(points)
+        if torso is None:
+            return None
+
+        center_x = torso["hip_mid"][0]
+        center_y = torso["hip_mid"][1] + torso["torso_height"] * 0.18
+        box_width = max(torso["hip_width"] * 0.9, 36)
+        box_height = max(torso["torso_height"] * 0.28, 30)
+        return self._bbox_from_center(center_x, center_y, box_width, box_height, frame_width, frame_height)
+
+    def _build_pose_feet_bbox(self, points, frame_width, frame_height):
+        left_ankle = self._point_xy(points, "left_ankle")
+        right_ankle = self._point_xy(points, "right_ankle")
+        ankles = [point for point in [left_ankle, right_ankle] if point is not None]
+        if not ankles:
+            return None
+
+        center_x = sum(point[0] for point in ankles) / len(ankles)
+        center_y = sum(point[1] for point in ankles) / len(ankles)
+        if len(ankles) == 2:
+            width = max(self._point_distance(left_ankle, right_ankle) * 1.15, 34)
+        else:
+            width = 34
+        return self._bbox_from_center(center_x, center_y, width, max(width * 0.45, 18), frame_width, frame_height)
+
+    def _append_pose_detection(self, detections, bbox, class_name, confidence, person_idx):
+        if bbox is None:
+            return
+        detections.append(
+            {
+                "bbox": bbox,
+                "class": -1,
+                "class_name": class_name,
+                "confidence": confidence,
+                "is_sensitive": class_name in self.sensitive_labels,
+                "is_female": class_name in self.female_sensitive_labels,
+                "person_idx": person_idx,
+            }
+        )
+
+    def _detect_with_pose(self, frame):
+        frame_height, frame_width = frame.shape[:2]
+        results = self.pose_model(frame, conf=0.25, imgsz=self.pose_imgsz, verbose=False)
+        if not results:
+            return []
+
+        keypoints = getattr(results[0], "keypoints", None)
+        if keypoints is None or keypoints.xy is None:
+            return []
+
+        boxes = results[0].boxes
+        keypoints_xy = keypoints.xy.cpu().numpy()
+        keypoints_conf = keypoints.conf.cpu().numpy() if keypoints.conf is not None else None
+        final_detections = []
+
+        for person_idx, person_points in enumerate(keypoints_xy):
+            point_conf = keypoints_conf[person_idx] if keypoints_conf is not None else None
+            points = self._extract_pose_points(person_points, point_conf)
+            if not points:
+                continue
+            confidence = 0.5
+            if boxes is not None and len(boxes) > person_idx:
+                confidence = float(boxes[person_idx].conf[0])
+
+            self._append_pose_detection(
+                final_detections,
+                self._build_pose_face_bbox(points, frame_width, frame_height),
+                "FACE_FEMALE",
+                confidence,
+                person_idx,
+            )
+            self._append_pose_detection(
+                final_detections,
+                self._build_pose_eye_bbox(points, frame_width, frame_height),
+                "eye",
+                confidence,
+                person_idx,
+            )
+            self._append_pose_detection(
+                final_detections,
+                self._build_pose_breast_bbox(points, frame_width, frame_height),
+                "FEMALE_BREAST_COVERED",
+                confidence,
+                person_idx,
+            )
+            self._append_pose_detection(
+                final_detections,
+                self._build_pose_belly_bbox(points, frame_width, frame_height),
+                "BELLY_COVERED",
+                confidence,
+                person_idx,
+            )
+            self._append_pose_detection(
+                final_detections,
+                self._build_pose_genitalia_bbox(points, frame_width, frame_height),
+                "FEMALE_GENITALIA_COVERED",
+                confidence,
+                person_idx,
+            )
+            self._append_pose_detection(
+                final_detections,
+                self._build_pose_buttocks_bbox(points, frame_width, frame_height),
+                "BUTTOCKS_COVERED",
+                confidence,
+                person_idx,
+            )
+            self._append_pose_detection(
+                final_detections,
+                self._build_pose_feet_bbox(points, frame_width, frame_height),
+                "FEET_COVERED",
+                confidence,
+                person_idx,
+            )
+
+        return final_detections
 
     def _merge_breast_boxes(self, breast_detections):
         """
@@ -1199,11 +1566,10 @@ class RealtimeCascadeDetector:
 
         return frame
 
-    def _annotate_frame(self, frame):
-        """对单帧进行检测和遮蔽（用于屏幕捕获模式）"""
+    def _detect_with_nudenet(self, frame):
         height, width = frame.shape[:2]
 
-        results_fast = self.fast_model(frame, conf=0.3, classes=[0])
+        results_fast = self.fast_model(frame, conf=0.3, classes=[0], verbose=False)
         candidates = []
         for box in results_fast[0].boxes:
             x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
@@ -1230,10 +1596,10 @@ class RealtimeCascadeDetector:
 
         precise_model, nude_imgsz = self.get_nude_model_and_imgsz()
 
-        BATCH_SIZE = 2
+        batch_size = 2
         if person_rois:
-            for batch_start in range(0, len(person_rois), BATCH_SIZE):
-                batch_end = min(batch_start + BATCH_SIZE, len(person_rois))
+            for batch_start in range(0, len(person_rois), batch_size):
+                batch_end = min(batch_start + batch_size, len(person_rois))
                 batch_rois = person_rois[batch_start:batch_end]
                 batch_indices = person_indices[batch_start:batch_end]
                 batch_roi_data = person_roi_data[batch_start:batch_end]
@@ -1255,11 +1621,12 @@ class RealtimeCascadeDetector:
                         bx1, by1, bx2, by2 = x1 + rx1, y1 + ry1, x1 + rx2, y1 + ry2
 
                         if label_name in ("FEMALE_GENITALIA_EXPOSED", "FEMALE_GENITALIA_COVERED"):
-                            w, h = bx2 - bx1, by2 - by1
-                            cx, cy = (bx1 + bx2) // 2, (by1 + by2) // 2
-                            new_w, new_h = int(w * self.GENITALIA_PAD_X), int(h * self.GENITALIA_PAD_Y)
-                            bx1, by1 = cx - new_w // 2, cy - new_h // 2
-                            bx2, by2 = cx + new_w // 2, cy + new_h // 2
+                            width_box, height_box = bx2 - bx1, by2 - by1
+                            center_x, center_y = (bx1 + bx2) // 2, (by1 + by2) // 2
+                            new_width = int(width_box * self.GENITALIA_PAD_X)
+                            new_height = int(height_box * self.GENITALIA_PAD_Y)
+                            bx1, by1 = center_x - new_width // 2, center_y - new_height // 2
+                            bx2, by2 = center_x + new_width // 2, center_y + new_height // 2
 
                         final_detections.append(
                             {
@@ -1289,8 +1656,8 @@ class RealtimeCascadeDetector:
                 face_roi_coords[person_idx] = (fx1, fy1)
 
             if face_roi_list:
-                for batch_start in range(0, len(face_roi_list), BATCH_SIZE):
-                    batch_end = min(batch_start + BATCH_SIZE, len(face_roi_list))
+                for batch_start in range(0, len(face_roi_list), batch_size):
+                    batch_end = min(batch_start + batch_size, len(face_roi_list))
                     batch_rois = face_roi_list[batch_start:batch_end]
                     batch_indices = face_idx_list[batch_start:batch_end]
 
@@ -1305,7 +1672,8 @@ class RealtimeCascadeDetector:
                         for er in res.boxes:
                             cls_id = int(er.cls[0])
                             label_name = self.eye_model.names[cls_id]
-
+                            if label_name != "eye":
+                                continue
                             ex1, ey1, ex2, ey2 = map(int, er.xyxy[0].tolist())
                             final_detections.append(
                                 {
@@ -1319,6 +1687,16 @@ class RealtimeCascadeDetector:
                                 }
                             )
 
+        return final_detections
+
+    def _detect_frame(self, frame):
+        if self.control_panel and self.control_panel.get_detector_mode() == "pose":
+            return self._detect_with_pose(frame)
+        return self._detect_with_nudenet(frame)
+
+    def _annotate_frame(self, frame):
+        """对单帧进行检测和遮蔽（用于屏幕捕获模式）"""
+        final_detections = self._detect_frame(frame)
         return self.draw_results(frame, final_detections)
 
     def _merge_audio(self, video_source, temp_video, output_path):
@@ -1553,158 +1931,7 @@ class RealtimeCascadeDetector:
             if downscale_720p:
                 frame = cv2.resize(frame, (target_width, target_height), interpolation=cv2.INTER_LINEAR)
 
-            # ----------------- 第一阶段：检测人 -----------------
-            results_fast = self.fast_model(frame, conf=0.3, classes=[0])
-            candidates = []
-            for box in results_fast[0].boxes:
-                x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
-                pad = 50
-                x1 = max(0, x1 - pad)
-                y1 = max(0, y1 - pad)
-                x2 = min(target_width, x2 + pad)
-                y2 = min(target_height, y2 + pad)
-                candidates.append((x1, y1, x2, y2))
-
-            # ----------------- 第二阶段：NudeNet 检测（批量分片）-----------------
-            precise_model, nude_imgsz = self.get_nude_model_and_imgsz()
-            final_detections = []
-            face_rois = {}
-
-            person_rois = []
-            person_indices = []
-            person_roi_data = []
-            for idx, (x1, y1, x2, y2) in enumerate(candidates):
-                roi = frame[y1:y2, x1:x2]
-                if roi.size == 0:
-                    continue
-                person_rois.append(roi)
-                person_indices.append(idx)
-                person_roi_data.append((idx, x1, y1))
-
-            BATCH_SIZE = 2
-            if person_rois:
-                for batch_start in range(0, len(person_rois), BATCH_SIZE):
-                    batch_end = min(batch_start + BATCH_SIZE, len(person_rois))
-                    batch_rois = person_rois[batch_start:batch_end]
-                    batch_indices = person_indices[batch_start:batch_end]
-                    batch_roi_data = person_roi_data[batch_start:batch_end]
-
-                    precise_results = self._run_roi_model(
-                        precise_model, batch_rois, conf=0.2, imgsz=nude_imgsz, rect=False
-                    )
-
-                    for i, res in enumerate(precise_results):
-                        person_idx = batch_indices[i]
-                        idx, x1, y1 = batch_roi_data[i]
-
-                        for pr in res.boxes:
-                            rx1, ry1, rx2, ry2 = map(int, pr.xyxy[0].tolist())
-                            conf = float(pr.conf[0])
-                            cls = int(pr.cls[0])
-                            label_name = self.get_label_name(cls)
-
-                            bx1, by1, bx2, by2 = x1 + rx1, y1 + ry1, x1 + rx2, y1 + ry2
-
-                            if label_name in ("FEMALE_GENITALIA_EXPOSED", "FEMALE_GENITALIA_COVERED"):
-                                w, h = bx2 - bx1, by2 - by1
-                                cx, cy = (bx1 + bx2) // 2, (by1 + by2) // 2
-                                new_w, new_h = int(w * self.GENITALIA_PAD_X), int(h * self.GENITALIA_PAD_Y)
-                                bx1, by1 = cx - new_w // 2, cy - new_h // 2
-                                bx2, by2 = cx + new_w // 2, cy + new_h // 2
-
-                            final_detections.append(
-                                {
-                                    "bbox": (bx1, by1, bx2, by2),
-                                    "class": cls,
-                                    "class_name": label_name,
-                                    "confidence": conf,
-                                    "is_sensitive": label_name in self.sensitive_labels,
-                                    "is_female": label_name in self.female_sensitive_labels,
-                                    "person_idx": person_idx,
-                                }
-                            )
-
-                            if label_name in ("FACE_FEMALE", "FACE_MALE"):
-                                face_rois[person_idx] = (x1 + rx1, y1 + ry1, x1 + rx2, y1 + ry2)
-
-                        if self.control_panel.get_debug_enabled() and frame_id % 30 == 0:
-                            roi_annotated = batch_rois[i].copy()
-                            for det in final_detections:
-                                if det["person_idx"] == person_idx:
-                                    gx1, gy1, gx2, gy2 = det["bbox"]
-                                    rx1 = gx1 - x1
-                                    ry1 = gy1 - y1
-                                    rx2 = gx2 - x1
-                                    ry2 = gy2 - y1
-                                    color = (
-                                        (0, 0, 255) if det["is_sensitive"] else (0, 255, 255)
-                                    )
-                                    cv2.rectangle(
-                                        roi_annotated, (rx1, ry1), (rx2, ry2), color, 2
-                                    )
-                                    label = f"{det['class_name']}: {det['confidence']:.2f}"
-                                    cv2.putText(
-                                        roi_annotated,
-                                        label,
-                                        (rx1, ry1 - 5),
-                                        cv2.FONT_HERSHEY_SIMPLEX,
-                                        0.4,
-                                        color,
-                                        1,
-                                    )
-                            cv2.imwrite(
-                                f"./debug_roi/debug_roi_{frame_id}_{person_idx}.jpg", roi_annotated
-                            )
-
-            # ----------------- 第三阶段：Eye 模型检测（批量分片）-----------------
-            if face_rois:
-                face_roi_list = []
-                face_idx_list = []
-                face_roi_coords = {}
-                for person_idx, (fx1, fy1, fx2, fy2) in face_rois.items():
-                    face_roi = frame[fy1:fy2, fx1:fx2]
-                    if face_roi.size == 0:
-                        continue
-                    face_roi_list.append(face_roi)
-                    face_idx_list.append(person_idx)
-                    face_roi_coords[person_idx] = (fx1, fy1)
-
-                if face_roi_list:
-                    for batch_start in range(0, len(face_roi_list), BATCH_SIZE):
-                        batch_end = min(batch_start + BATCH_SIZE, len(face_roi_list))
-                        batch_rois = face_roi_list[batch_start:batch_end]
-                        batch_indices = face_idx_list[batch_start:batch_end]
-
-                        eye_results = self._run_roi_model(
-                            self.eye_model, batch_rois, conf=0.2, imgsz=320, rect=False
-                        )
-
-                        for i, res in enumerate(eye_results):
-                            person_idx = batch_indices[i]
-                            fx1, fy1 = face_roi_coords[person_idx]
-
-                            for er in res.boxes:
-                                cls_id = int(er.cls[0])
-                                label_name = self.eye_model.names[cls_id]
-                                if label_name != "eye":
-                                    continue
-                                er_x1, er_y1, er_x2, er_y2 = map(int, er.xyxy[0].tolist())
-                                final_detections.append(
-                                    {
-                                        "bbox": (
-                                            fx1 + er_x1,
-                                            fy1 + er_y1,
-                                            fx1 + er_x2,
-                                            fy1 + er_y2,
-                                        ),
-                                        "class": 999,
-                                        "class_name": "eye",
-                                        "confidence": float(er.conf[0]),
-                                        "is_sensitive": True,
-                                        "is_female": True,
-                                        "person_idx": person_idx,
-                                    }
-                                )
+            final_detections = self._detect_frame(frame)
 
             # 绘制并写入 ffmpeg 管道
             annotated = self.draw_results(frame, final_detections)
