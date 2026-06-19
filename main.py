@@ -26,6 +26,10 @@ class VideoReader:
         self.gpu_fallback_reason = None
 
     @staticmethod
+    def _supports_cuvid():
+        return platform.system() == "Windows"
+
+    @staticmethod
     def _parse_fps(fps_text):
         if not fps_text or fps_text == "0/0":
             return 0.0
@@ -141,7 +145,12 @@ class VideoReader:
             if frame_size <= 0:
                 raise ValueError(f"invalid frame size {self.width}x{self.height}")
             while self.running:
-                raw = self.proc.stdout.read(frame_size)
+                raw = bytearray()
+                while len(raw) < frame_size:
+                    chunk = self.proc.stdout.read(frame_size - len(raw))
+                    if not chunk:
+                        break
+                    raw.extend(chunk)
                 if len(raw) < frame_size:
                     break
                 frame = np.frombuffer(raw, dtype=np.uint8).reshape((self.height, self.width, 3)).copy()
@@ -179,8 +188,12 @@ class VideoReader:
             if not self._start_cpu_capture():
                 return False
         elif self.use_gpu:
+            if not self._supports_cuvid():
+                if not self._fallback_to_cpu("cuvid decode is unavailable on this platform"):
+                    return False
             if not self._probe_video_info():
-                return self._fallback_to_cpu("ffprobe failed to read video dimensions")
+                if not self._fallback_to_cpu("ffprobe failed to read video dimensions"):
+                    return False
             if self.fps <= 0:
                 self.fps = 30.0
         else:
@@ -194,7 +207,8 @@ class VideoReader:
 
     def read(self):
         try:
-            self.ret, self.frame = self.queue.get(timeout=1.0)
+            timeout = 5.0 if self.source != 0 else 1.0
+            self.ret, self.frame = self.queue.get(timeout=timeout)
             return self.ret, self.frame
         except queue.Empty:
             return False, None
@@ -957,6 +971,13 @@ class RealtimeCascadeDetector:
         # 检查 ffmpeg 是否可用
         self.has_ffmpeg = self._check_ffmpeg()
 
+    def _run_roi_model(self, model, rois, **kwargs):
+        if not rois:
+            return []
+        if platform.system() == "Darwin":
+            return [model(roi, **kwargs)[0] for roi in rois]
+        return model(rois, **kwargs)
+
     @staticmethod
     def _check_ffmpeg():
         """检查 ffmpeg 是否可用"""
@@ -1217,7 +1238,9 @@ class RealtimeCascadeDetector:
                 batch_indices = person_indices[batch_start:batch_end]
                 batch_roi_data = person_roi_data[batch_start:batch_end]
 
-                precise_results = precise_model(batch_rois, conf=0.2, imgsz=nude_imgsz, rect=False)
+                precise_results = self._run_roi_model(
+                    precise_model, batch_rois, conf=0.2, imgsz=nude_imgsz, rect=False
+                )
 
                 for i, res in enumerate(precise_results):
                     person_idx = batch_indices[i]
@@ -1271,7 +1294,9 @@ class RealtimeCascadeDetector:
                     batch_rois = face_roi_list[batch_start:batch_end]
                     batch_indices = face_idx_list[batch_start:batch_end]
 
-                    eye_results = self.eye_model(batch_rois, conf=0.2, imgsz=320, rect=False)
+                    eye_results = self._run_roi_model(
+                        self.eye_model, batch_rois, conf=0.2, imgsz=320, rect=False
+                    )
 
                     for i, res in enumerate(eye_results):
                         person_idx = batch_indices[i]
@@ -1334,9 +1359,9 @@ class RealtimeCascadeDetector:
                 "-c:a",
                 "aac",
                 "-map",
-                "0:v:0",
+                "0:v",
                 "-map",
-                "1:a:0",
+                "1:a",
                 "-shortest",
                 output_path,
             ]
@@ -1353,6 +1378,28 @@ class RealtimeCascadeDetector:
                 print(f"无声视频已保存为: {output_path}")
                 return True
             print("音频合并失败，且无声临时视频不存在")
+            return False
+
+    def _source_has_audio(self, video_source):
+        if video_source == 0:
+            return False
+
+        try:
+            probe_cmd = [
+                "ffprobe",
+                "-v",
+                "error",
+                "-select_streams",
+                "a:0",
+                "-show_entries",
+                "stream=codec_type",
+                "-of",
+                "csv=p=0",
+                str(video_source),
+            ]
+            result = subprocess.run(probe_cmd, capture_output=True, text=True)
+            return "audio" in result.stdout
+        except Exception:
             return False
 
     def _process_video(self, video_source, output_path, preview):
@@ -1401,8 +1448,11 @@ class RealtimeCascadeDetector:
 
         target_size = self.control_panel.get_target_size_mb()
 
+        source_has_audio = self.has_ffmpeg and self._source_has_audio(video_source)
+
         # 构建 ffmpeg 命令
         temp_output = output_path.replace(".mp4", "_noaudio.mp4")
+        output_target = output_path if source_has_audio else temp_output
         ffmpeg_cmd = [
             "ffmpeg",
             "-y",
@@ -1419,6 +1469,9 @@ class RealtimeCascadeDetector:
             "-i",
             "-",
         ]
+
+        if source_has_audio:
+            ffmpeg_cmd.extend(["-i", str(video_source)])
 
         if target_size > 0 and duration > 0:
             # 有目标大小：计算码率
@@ -1443,14 +1496,27 @@ class RealtimeCascadeDetector:
             # 无目标大小：CRF 模式
             ffmpeg_cmd.extend(["-c:v", "libx264", "-preset", "medium", "-crf", "23"])
 
-        ffmpeg_cmd.append(temp_output)
+        if source_has_audio:
+            ffmpeg_cmd.extend([
+                "-map",
+                "0:v:0",
+                "-map",
+                "1:a:0",
+                "-c:a",
+                "aac",
+                "-shortest",
+                "-movflags",
+                "+faststart",
+            ])
+
+        ffmpeg_cmd.append(output_target)
 
         # 启动 ffmpeg 进程
         ffmpeg_proc = subprocess.Popen(
             ffmpeg_cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
         )
 
         os.makedirs("./debug_roi", exist_ok=True)
@@ -1461,6 +1527,9 @@ class RealtimeCascadeDetector:
         fps_start_time = time.time()
         fps_frame_count = 0
         current_fps = 0.0
+
+        ffmpeg_failed = False
+        ffmpeg_error = ""
 
         while True:
             if self.control_panel.is_stopped():
@@ -1520,7 +1589,9 @@ class RealtimeCascadeDetector:
                     batch_indices = person_indices[batch_start:batch_end]
                     batch_roi_data = person_roi_data[batch_start:batch_end]
 
-                    precise_results = precise_model(batch_rois, conf=0.2, imgsz=nude_imgsz, rect=False)
+                    precise_results = self._run_roi_model(
+                        precise_model, batch_rois, conf=0.2, imgsz=nude_imgsz, rect=False
+                    )
 
                     for i, res in enumerate(precise_results):
                         person_idx = batch_indices[i]
@@ -1604,7 +1675,9 @@ class RealtimeCascadeDetector:
                         batch_rois = face_roi_list[batch_start:batch_end]
                         batch_indices = face_idx_list[batch_start:batch_end]
 
-                        eye_results = self.eye_model(batch_rois, conf=0.2, imgsz=320, rect=False)
+                        eye_results = self._run_roi_model(
+                            self.eye_model, batch_rois, conf=0.2, imgsz=320, rect=False
+                        )
 
                         for i, res in enumerate(eye_results):
                             person_idx = batch_indices[i]
@@ -1635,7 +1708,15 @@ class RealtimeCascadeDetector:
 
             # 绘制并写入 ffmpeg 管道
             annotated = self.draw_results(frame, final_detections)
-            ffmpeg_proc.stdin.write(annotated.tobytes())
+            try:
+                ffmpeg_proc.stdin.write(annotated.tobytes())
+            except (BrokenPipeError, OSError):
+                ffmpeg_failed = True
+                ffmpeg_error = ffmpeg_proc.stderr.read().decode(errors="replace") if ffmpeg_proc.stderr else ""
+                print("ffmpeg 写入失败，已停止处理")
+                if ffmpeg_error:
+                    print(ffmpeg_error)
+                break
 
             # FPS 计算（每 10 帧更新一次）
             fps_frame_count += 1
@@ -1677,16 +1758,38 @@ class RealtimeCascadeDetector:
 
         # 最终统计
         reader.stop()
-        ffmpeg_proc.stdin.close()
-        ffmpeg_proc.wait()
+        if ffmpeg_proc.stdin and not ffmpeg_proc.stdin.closed:
+            ffmpeg_proc.stdin.close()
+        ffmpeg_return_code = ffmpeg_proc.wait()
+        if not ffmpeg_failed and ffmpeg_return_code != 0:
+            ffmpeg_failed = True
+            ffmpeg_error = ffmpeg_proc.stderr.read().decode(errors="replace") if ffmpeg_proc.stderr else ""
+            print(f"ffmpeg 退出异常，返回码: {ffmpeg_return_code}")
+            if ffmpeg_error:
+                print(ffmpeg_error)
         if preview:
             cv2.destroyAllWindows()
 
-        if not os.path.exists(temp_output):
+        if ffmpeg_proc.stderr:
+            ffmpeg_proc.stderr.close()
+
+        if ffmpeg_failed:
+            if os.path.exists(output_target):
+                os.remove(output_target)
+            if os.path.exists(temp_output):
+                os.remove(temp_output)
+            self.control_panel.status_label.configure(
+                text="处理失败：ffmpeg 编码失败", foreground="red"
+            )
+            return False
+
+        expected_output = output_target
+
+        if not os.path.exists(expected_output):
             self.control_panel.status_label.configure(
                 text="处理失败：输出视频未生成", foreground="red"
             )
-            print(f"输出失败：未生成临时视频 {temp_output}")
+            print(f"输出失败：未生成输出视频 {expected_output}")
             return False
 
         stopped = self.control_panel.is_stopped()
@@ -1702,8 +1805,11 @@ class RealtimeCascadeDetector:
             )
             return False
 
-        # 合并音频（视频已是 H.264，直接 copy，不重编码）
-        if self.has_ffmpeg and video_source != 0:
+        # 已直接写入带音频输出，无需二次合并
+        if source_has_audio:
+            if os.path.exists(temp_output):
+                os.remove(temp_output)
+        elif self.has_ffmpeg and video_source != 0:
             merged = self._merge_audio(video_source, temp_output, output_path)
             if os.path.exists(temp_output):
                 os.remove(temp_output)

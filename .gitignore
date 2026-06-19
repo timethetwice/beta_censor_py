@@ -47,6 +47,7 @@ uv.lock
 !models/nudenet_640m.pt
 !models/yolo26n.pt
 !models/face-parts-yolov8n.pt
+!models/yolo26n-pose.pt
 
 # 临时文件
 temp_roi.jpg
