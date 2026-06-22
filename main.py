@@ -1794,6 +1794,8 @@ class RealtimeCascadeDetector:
 
     def _merge_audio(self, video_source, temp_video, output_path):
         """用 ffmpeg 将原视频的音频合并到输出视频（视频流直接 copy）"""
+        import time
+
         if not os.path.exists(temp_video):
             print(f"音频合并跳过：未找到临时视频 {temp_video}")
             return False
@@ -1821,6 +1823,9 @@ class RealtimeCascadeDetector:
             merge_cmd = [
                 "ffmpeg",
                 "-y",
+                "-loglevel",
+                "error",
+                "-nostats",
                 "-i",
                 temp_video,
                 "-i",
@@ -1828,7 +1833,7 @@ class RealtimeCascadeDetector:
                 "-c:v",
                 "copy",
                 "-c:a",
-                "aac",
+                "copy",
                 "-map",
                 "0:v",
                 "-map",
@@ -1838,17 +1843,37 @@ class RealtimeCascadeDetector:
             ]
 
             print("正在合并音频...")
-            subprocess.run(merge_cmd, capture_output=True, check=True)
+            merge_proc = subprocess.Popen(
+                merge_cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+            while True:
+                return_code = merge_proc.poll()
+                if return_code is not None:
+                    if return_code != 0:
+                        stderr_output = (
+                            merge_proc.stderr.read().decode(errors="replace")
+                            if merge_proc.stderr
+                            else ""
+                        )
+                        raise subprocess.CalledProcessError(
+                            return_code,
+                            merge_cmd,
+                            stderr=stderr_output.encode(),
+                        )
+                    break
+                if self.control_panel is not None:
+                    self.control_panel.update()
+                time.sleep(0.05)
+            if merge_proc.stderr:
+                merge_proc.stderr.close()
             print(f"音频合并完成: {output_path}")
             return True
 
         except subprocess.CalledProcessError as e:
             print(f"音频合并失败: {e.stderr.decode() if e.stderr else str(e)}")
-            if os.path.exists(temp_video):
-                os.rename(temp_video, output_path)
-                print(f"无声视频已保存为: {output_path}")
-                return True
-            print("音频合并失败，且无声临时视频不存在")
+            print("音频合并失败，保留无声临时视频供排查")
             return False
 
     def _source_has_audio(self, video_source):
@@ -1930,6 +1955,9 @@ class RealtimeCascadeDetector:
         ffmpeg_cmd = [
             "ffmpeg",
             "-y",
+            "-loglevel",
+            "error",
+            "-nostats",
             "-f",
             "rawvideo",
             "-vcodec",
@@ -2112,7 +2140,16 @@ class RealtimeCascadeDetector:
         reader.stop()
         if ffmpeg_proc.stdin and not ffmpeg_proc.stdin.closed:
             ffmpeg_proc.stdin.close()
-        ffmpeg_return_code = ffmpeg_proc.wait()
+        while True:
+            ffmpeg_return_code = ffmpeg_proc.poll()
+            if ffmpeg_return_code is not None:
+                break
+            if self.control_panel is not None:
+                self.control_panel.status_label.configure(
+                    text="视频处理完成，正在写入输出文件...", foreground="orange"
+                )
+                self.control_panel.update()
+            time.sleep(0.05)
         if not ffmpeg_failed and ffmpeg_return_code != 0:
             ffmpeg_failed = True
             ffmpeg_error = ffmpeg_proc.stderr.read().decode(errors="replace") if ffmpeg_proc.stderr else ""
