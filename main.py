@@ -2,11 +2,14 @@ from ultralytics import YOLO
 import cv2
 import tkinter as tk
 from tkinter import ttk, filedialog
+import json
 import os
 import numpy as np
 import subprocess
 import platform
 import queue
+import sys
+import tempfile
 import threading
 
 from Screen_Censor import TransparentProtectionWindow
@@ -211,7 +214,9 @@ class VideoReader:
             self.ret, self.frame = self.queue.get(timeout=timeout)
             return self.ret, self.frame
         except queue.Empty:
-            return False, None
+            if not self.running and self.queue.empty():
+                return False, None
+            return None, None
 
     def stop(self):
         self.running = False
@@ -303,6 +308,7 @@ class DetectionControlPanel:
         self._target_size_mb = tk.DoubleVar(value=0)
         self._nude_model = tk.StringVar(value="640m")
         self._detector_mode = tk.StringVar(value="nudenet")
+        self._parallel_segments = tk.IntVar(value=0)
 
         self._censor_mode = tk.StringVar(value="black")
         self._blur_kernel = tk.IntVar(value=81)
@@ -356,6 +362,14 @@ class DetectionControlPanel:
             foreground="gray",
         )
         self.status_label.pack()
+        self.worker_status_label = ttk.Label(
+            bottom_frame,
+            text="",
+            foreground="gray",
+            justify=tk.LEFT,
+            anchor="w",
+        )
+        self.worker_status_label.pack(fill=tk.X)
 
     def _build_video_tab(self, parent):
         # 输入视频
@@ -413,6 +427,15 @@ class DetectionControlPanel:
         ttk.Radiobutton(
             detector_row, text="Pose", variable=self._detector_mode, value="pose"
         ).pack(side=tk.LEFT)
+
+        parallel_row = ttk.Frame(parent)
+        parallel_row.pack(fill=tk.X, pady=(5, 0))
+        ttk.Label(parallel_row, text="单文件并行:", width=10).pack(side=tk.LEFT)
+        self.parallel_segments_entry = ttk.Entry(
+            parallel_row, textvariable=self._parallel_segments, width=10
+        )
+        self.parallel_segments_entry.pack(side=tk.LEFT, padx=(0, 3))
+        ttk.Label(parallel_row, text="段 (0=自动, 1=关闭)").pack(side=tk.LEFT)
 
         # 预览开关
         self._show_preview = tk.BooleanVar(value=True)
@@ -698,6 +721,7 @@ class DetectionControlPanel:
         self.start_btn.configure(text="●  检测中...", state="disabled")
         self.stop_btn.configure(state="normal")
         self.status_label.configure(text="已开始检测...", foreground="green")
+        self.set_worker_status_text("")
 
     def _on_stop(self):
         self._stopped = True
@@ -792,6 +816,27 @@ class DetectionControlPanel:
     def get_target_size_mb(self):
         return self._target_size_mb.get()
 
+    def get_parallel_segments(self):
+        return max(0, int(self._parallel_segments.get()))
+
+    def export_settings(self):
+        return {
+            "debug_enabled": self.get_debug_enabled(),
+            "target_size_mb": self.get_target_size_mb(),
+            "nude_model": self.get_nude_model(),
+            "detector_mode": self.get_detector_mode(),
+            "censor_mode": self.get_censor_mode(),
+            "censor_params": self.get_censor_params(),
+            "buffer_frames": self.get_buffer_frames(),
+            "genitalia_buffer_frames": self.get_genitalia_buffer_frames(),
+            "downscale_720p": self.get_downscale_720p(),
+            "preview": self.get_preview(),
+            "parallel_segments": self.get_parallel_segments(),
+            "enabled_labels": [
+                label for label, var in self._label_vars.items() if var.get()
+            ],
+        }
+
     def _should_draw_pose_label(self, class_name):
         pose_aliases = {
             "FACE_FEMALE": ["FACE_FEMALE", "FACE_MALE"],
@@ -849,6 +894,9 @@ class DetectionControlPanel:
         if self._running:
             self.root.update()
         return self._running
+
+    def set_worker_status_text(self, text):
+        self.worker_status_label.configure(text=text)
 
     def _on_close(self):
         self._running = False
@@ -969,6 +1017,143 @@ class CensorEffects:
         return frame
 
 
+class _HeadlessStatusLabel:
+    def configure(self, **kwargs):
+        return None
+
+
+class HeadlessControlPanel:
+    def __init__(self, settings, sensitive_labels, female_sensitive_labels):
+        self.settings = settings
+        self.sensitive_labels = sensitive_labels
+        self.female_sensitive_labels = female_sensitive_labels
+        self.enabled_labels = set(settings.get("enabled_labels", []))
+        self.status_label = _HeadlessStatusLabel()
+        self.progress_path = settings.get("progress_path")
+        self.worker_name = settings.get("worker_name", "worker")
+
+    def update(self):
+        return True
+
+    def is_stopped(self):
+        return False
+
+    def update_fps(self, fps):
+        self._write_progress(fps=fps)
+        return None
+
+    def update_frame_count(self, current, total):
+        self._write_progress(current_frame=current, total_frames=total)
+        return None
+
+    def get_censor_mode(self):
+        return self.settings.get("censor_mode", "black")
+
+    def get_censor_params(self):
+        return dict(self.settings.get("censor_params", {}))
+
+    def get_buffer_frames(self):
+        return int(self.settings.get("buffer_frames", 5))
+
+    def get_genitalia_buffer_frames(self):
+        return int(self.settings.get("genitalia_buffer_frames", 10))
+
+    def get_debug_enabled(self):
+        return bool(self.settings.get("debug_enabled", False))
+
+    def get_downscale_720p(self):
+        return bool(self.settings.get("downscale_720p", False))
+
+    def get_nude_model(self):
+        return self.settings.get("nude_model", "640m")
+
+    def get_detector_mode(self):
+        return self.settings.get("detector_mode", "nudenet")
+
+    def get_target_size_mb(self):
+        return float(self.settings.get("target_size_mb", 0))
+
+    def get_parallel_segments(self):
+        return max(1, int(self.settings.get("parallel_segments", 1)))
+
+    def should_draw(self, class_name):
+        if self.get_detector_mode() == "pose":
+            pose_aliases = {
+                "FACE_FEMALE": ["FACE_FEMALE", "FACE_MALE"],
+                "FACE_MALE": ["FACE_FEMALE", "FACE_MALE"],
+                "eye": ["eye"],
+                "FEMALE_BREAST_COVERED": [
+                    "FEMALE_BREAST_EXPOSED",
+                    "FEMALE_BREAST_COVERED",
+                    "MALE_BREAST_EXPOSED",
+                ],
+                "FEMALE_BREAST_EXPOSED": [
+                    "FEMALE_BREAST_EXPOSED",
+                    "FEMALE_BREAST_COVERED",
+                    "MALE_BREAST_EXPOSED",
+                ],
+                "MALE_BREAST_EXPOSED": [
+                    "FEMALE_BREAST_EXPOSED",
+                    "FEMALE_BREAST_COVERED",
+                    "MALE_BREAST_EXPOSED",
+                ],
+                "BELLY_COVERED": ["BELLY_EXPOSED", "BELLY_COVERED"],
+                "BELLY_EXPOSED": ["BELLY_EXPOSED", "BELLY_COVERED"],
+                "FEMALE_GENITALIA_COVERED": [
+                    "FEMALE_GENITALIA_EXPOSED",
+                    "FEMALE_GENITALIA_COVERED",
+                    "MALE_GENITALIA_EXPOSED",
+                ],
+                "FEMALE_GENITALIA_EXPOSED": [
+                    "FEMALE_GENITALIA_EXPOSED",
+                    "FEMALE_GENITALIA_COVERED",
+                    "MALE_GENITALIA_EXPOSED",
+                ],
+                "MALE_GENITALIA_EXPOSED": [
+                    "FEMALE_GENITALIA_EXPOSED",
+                    "FEMALE_GENITALIA_COVERED",
+                    "MALE_GENITALIA_EXPOSED",
+                ],
+                "BUTTOCKS_COVERED": ["BUTTOCKS_EXPOSED", "BUTTOCKS_COVERED"],
+                "BUTTOCKS_EXPOSED": ["BUTTOCKS_EXPOSED", "BUTTOCKS_COVERED"],
+                "FEET_COVERED": ["FEET_EXPOSED", "FEET_COVERED"],
+                "FEET_EXPOSED": ["FEET_EXPOSED", "FEET_COVERED"],
+            }
+            labels = pose_aliases.get(class_name, [class_name])
+            enabled = any(label in self.enabled_labels for label in labels)
+            if enabled and class_name in ("FACE_FEMALE", "FACE_MALE") and "eye" in self.enabled_labels:
+                return False
+            return enabled
+
+        if class_name in ("FACE_FEMALE", "FACE_MALE") and class_name in self.enabled_labels:
+            return "eye" not in self.enabled_labels
+        return class_name in self.enabled_labels
+
+    def _write_progress(self, fps=None, current_frame=None, total_frames=None, status=None):
+        if not self.progress_path:
+            return
+        payload = {
+            "worker_name": self.worker_name,
+            "fps": float(fps if fps is not None else self.settings.get("_last_fps", 0.0)),
+            "current_frame": int(
+                current_frame if current_frame is not None else self.settings.get("_last_frame", 0)
+            ),
+            "total_frames": int(
+                total_frames if total_frames is not None else self.settings.get("_last_total", 0)
+            ),
+            "status": status or self.settings.get("_last_status", "running"),
+        }
+        self.settings["_last_fps"] = payload["fps"]
+        self.settings["_last_frame"] = payload["current_frame"]
+        self.settings["_last_total"] = payload["total_frames"]
+        self.settings["_last_status"] = payload["status"]
+        try:
+            with open(self.progress_path, "w", encoding="utf-8") as progress_file:
+                json.dump(payload, progress_file, ensure_ascii=True)
+        except OSError:
+            return
+
+
 class RealtimeCascadeDetector:
     def __init__(self, fast_model=None, precise_model=None):
         if platform.system() == "Darwin":  # macOS
@@ -1076,6 +1261,370 @@ class RealtimeCascadeDetector:
         self.buffer_frames = 5  # 缓冲帧数
         # 检查 ffmpeg 是否可用
         self.has_ffmpeg = self._check_ffmpeg()
+
+    @staticmethod
+    def _ffprobe_duration(video_path):
+        try:
+            result = subprocess.run(
+                [
+                    "ffprobe",
+                    "-v",
+                    "error",
+                    "-show_entries",
+                    "format=duration",
+                    "-of",
+                    "csv=p=0",
+                    str(video_path),
+                ],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            return float(result.stdout.strip())
+        except Exception:
+            return 0.0
+
+    @staticmethod
+    def _split_video_segment(input_path, segment_path, start_time, duration):
+        split_cmd = [
+            "ffmpeg",
+            "-y",
+            "-loglevel",
+            "error",
+            "-nostats",
+            "-ss",
+            f"{start_time:.3f}",
+            "-i",
+            str(input_path),
+            "-t",
+            f"{duration:.3f}",
+            "-c",
+            "copy",
+            str(segment_path),
+        ]
+        subprocess.run(split_cmd, check=True, capture_output=True, text=True)
+
+    @staticmethod
+    def _concat_processed_segments(segment_outputs, output_path):
+        concat_dir = os.path.dirname(output_path) or "."
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".txt", delete=False, dir=concat_dir, encoding="utf-8"
+        ) as concat_file:
+            concat_list_path = concat_file.name
+            for segment_output in segment_outputs:
+                safe_path = os.path.abspath(segment_output).replace("'", "'\\''")
+                concat_file.write(f"file '{safe_path}'\n")
+
+        try:
+            concat_cmd = [
+                "ffmpeg",
+                "-y",
+                "-loglevel",
+                "error",
+                "-nostats",
+                "-f",
+                "concat",
+                "-safe",
+                "0",
+                "-i",
+                concat_list_path,
+                "-c",
+                "copy",
+                str(output_path),
+            ]
+            subprocess.run(concat_cmd, check=True, capture_output=True, text=True)
+        finally:
+            if os.path.exists(concat_list_path):
+                os.remove(concat_list_path)
+
+    @staticmethod
+    def _build_worker_payload(settings, video_path, output_path):
+        return {
+            "settings": settings,
+            "video_path": str(video_path),
+            "output_path": str(output_path),
+        }
+
+    @staticmethod
+    def _terminate_process_tree(proc):
+        if proc is None or proc.poll() is not None:
+            return
+
+        if platform.system() == "Windows":
+            try:
+                subprocess.run(
+                    ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+            except Exception:
+                pass
+
+        if proc.poll() is None:
+            try:
+                proc.terminate()
+                proc.wait(timeout=1.0)
+            except Exception:
+                if proc.poll() is None:
+                    try:
+                        proc.kill()
+                        proc.wait(timeout=1.0)
+                    except Exception:
+                        pass
+
+    @staticmethod
+    def _read_text_if_exists(path):
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as handle:
+                return handle.read().strip()
+        except OSError:
+            return ""
+
+    def _launch_worker_subprocess(self, payload, payload_path, stdout_path, stderr_path):
+        with open(payload_path, "w", encoding="utf-8") as payload_file:
+            json.dump(payload, payload_file, ensure_ascii=True)
+
+        creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        stdout_handle = open(stdout_path, "w", encoding="utf-8", errors="replace")
+        stderr_handle = open(stderr_path, "w", encoding="utf-8", errors="replace")
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, __file__, "--worker-payload", payload_path],
+                stdout=stdout_handle,
+                stderr=stderr_handle,
+                creationflags=creationflags,
+            )
+        except Exception:
+            stdout_handle.close()
+            stderr_handle.close()
+            raise
+
+        return {
+            "process": proc,
+            "stdout_handle": stdout_handle,
+            "stderr_handle": stderr_handle,
+            "stdout_path": stdout_path,
+            "stderr_path": stderr_path,
+            "payload_path": payload_path,
+        }
+
+    def _close_worker_handles(self, worker):
+        for handle_key in ("stdout_handle", "stderr_handle"):
+            handle = worker.get(handle_key)
+            if handle:
+                handle.close()
+                worker[handle_key] = None
+
+    @staticmethod
+    def _read_worker_progress(progress_path):
+        try:
+            with open(progress_path, "r", encoding="utf-8") as progress_file:
+                return json.load(progress_file)
+        except (OSError, json.JSONDecodeError):
+            return None
+
+    @staticmethod
+    def _run_worker_payload(payload):
+        detector = RealtimeCascadeDetector()
+        detector.control_panel = HeadlessControlPanel(
+            payload["settings"], detector.sensitive_labels, detector.female_sensitive_labels
+        )
+        detector.censor_buffer = None
+        detector.genitalia_censor_buffer = None
+        detector.control_panel._write_progress(status="starting")
+        try:
+            success = detector._process_video(
+                payload["video_path"], payload["output_path"], preview=False
+            )
+            detector.control_panel._write_progress(status="done" if success else "failed")
+            return success
+        except Exception:
+            detector.control_panel._write_progress(status="failed")
+            raise
+
+    def _get_parallel_segment_count(self, video_path):
+        if platform.system() != "Windows":
+            return 1
+        manual_segments = self.control_panel.get_parallel_segments()
+        if manual_segments > 0:
+            return manual_segments
+        duration = self._ffprobe_duration(video_path)
+        if duration < 45:
+            return 1
+        cpu_count = os.cpu_count() or 1
+        if self.control_panel.get_detector_mode() == "pose":
+            return max(1, min(2, cpu_count // 4 if cpu_count >= 4 else 1))
+        nude_model = self.control_panel.get_nude_model()
+        if nude_model == "640m":
+            return max(1, min(3, cpu_count // 4 if cpu_count >= 4 else 1))
+        return max(1, min(4, cpu_count // 3 if cpu_count >= 6 else 2))
+
+    def _process_video_parallel_segments(self, video_path, output_path):
+        segment_count = self._get_parallel_segment_count(video_path)
+        duration = self._ffprobe_duration(video_path)
+        print(
+            f"单文件处理模式: {'并行' if segment_count > 1 else '单进程'} | 分段数: {segment_count} | 时长: {duration:.1f}s"
+        )
+        if segment_count <= 1:
+            if self.control_panel is not None:
+                self.control_panel.status_label.configure(
+                    text=f"单进程模式：分段数 {segment_count} | 时长 {duration:.1f}s",
+                    foreground="orange",
+                )
+                self.control_panel.fps_label.configure(text="FPS: 0.0 | 帧: 0 / 0")
+                self.control_panel.set_worker_status_text("当前未启用单文件并行")
+                self.control_panel.update()
+            return self._process_video(video_path, output_path, self.control_panel.get_preview())
+
+        if duration <= 0:
+            return self._process_video(video_path, output_path, self.control_panel.get_preview())
+
+        settings = self.control_panel.export_settings()
+        settings["preview"] = False
+        segment_duration = duration / segment_count
+        base_name = os.path.splitext(os.path.basename(video_path))[0]
+
+        self.control_panel.status_label.configure(
+            text=f"单文件并行处理中：切成 {segment_count} 段...", foreground="orange"
+        )
+        self.control_panel.update()
+
+        with tempfile.TemporaryDirectory(prefix="beta_censor_segments_") as temp_dir:
+            segment_inputs = []
+            segment_outputs = []
+            payloads = []
+            progress_paths = []
+            workers = []
+
+            for index in range(segment_count):
+                start_time = segment_duration * index
+                current_duration = duration - start_time if index == segment_count - 1 else segment_duration
+                segment_input = os.path.join(temp_dir, f"{base_name}_segment_{index:02d}.mp4")
+                segment_output = os.path.join(temp_dir, f"{base_name}_segment_{index:02d}_censored.mp4")
+                progress_path = os.path.join(temp_dir, f"worker_{index:02d}_progress.json")
+                self._split_video_segment(video_path, segment_input, start_time, current_duration)
+                segment_inputs.append(segment_input)
+                segment_outputs.append(segment_output)
+                progress_paths.append(progress_path)
+                segment_settings = dict(settings)
+                if settings.get("target_size_mb", 0) > 0:
+                    segment_settings["target_size_mb"] = settings["target_size_mb"] / segment_count
+                segment_settings["progress_path"] = progress_path
+                segment_settings["worker_name"] = f"W{index + 1}"
+                payloads.append(
+                    self._build_worker_payload(segment_settings, segment_input, segment_output)
+                )
+
+            self.control_panel.status_label.configure(
+                text=f"单文件并行处理中：{segment_count} 段并发检测...", foreground="orange"
+            )
+            self.control_panel.fps_label.configure(
+                text=f"并行模式: {segment_count} workers | 预览: 关闭 | 进度: 0/{segment_count}"
+            )
+            self.control_panel.set_worker_status_text(
+                "\n".join([f"W{index + 1}: starting" for index in range(segment_count)])
+            )
+            self.control_panel.update()
+
+            try:
+                for index, payload in enumerate(payloads):
+                    workers.append(
+                        self._launch_worker_subprocess(
+                            payload,
+                            os.path.join(temp_dir, f"worker_{index:02d}_payload.json"),
+                            os.path.join(temp_dir, f"worker_{index:02d}.out.log"),
+                            os.path.join(temp_dir, f"worker_{index:02d}.err.log"),
+                        )
+                    )
+
+                while True:
+                    if self.control_panel.is_stopped():
+                        for worker in workers:
+                            self._terminate_process_tree(worker["process"])
+                            self._close_worker_handles(worker)
+                        self.control_panel.status_label.configure(
+                            text="正在停止分段并行处理...", foreground="orange"
+                        )
+                        self.control_panel.set_worker_status_text(
+                            "\n".join([f"W{index + 1}: stopped" for index in range(segment_count)])
+                        )
+                        self.control_panel.update()
+                        return False
+
+                    done_count = sum(
+                        1 for worker in workers if worker["process"].poll() is not None
+                    )
+                    progress_items = [self._read_worker_progress(path) for path in progress_paths]
+                    active_items = [item for item in progress_items if item]
+                    total_fps = sum(item.get("fps", 0.0) for item in active_items)
+                    worker_lines = []
+                    for index, item in enumerate(progress_items):
+                        worker = workers[index]
+                        return_code = worker["process"].poll()
+                        if not item:
+                            if return_code is None:
+                                worker_lines.append(f"W{index + 1}: waiting")
+                            else:
+                                worker_lines.append(f"W{index + 1}: exited ({return_code})")
+                            continue
+                        current_frame = item.get("current_frame", 0)
+                        total_frames = item.get("total_frames", 0)
+                        status = item.get("status", "running")
+                        fps = item.get("fps", 0.0)
+                        worker_lines.append(
+                            f"W{index + 1}: {status} | {current_frame}/{total_frames} | {fps:.1f} FPS"
+                        )
+                    self.control_panel.status_label.configure(
+                        text=f"单文件并行处理中：已完成 {done_count}/{segment_count} 段",
+                        foreground="orange",
+                    )
+                    self.control_panel.fps_label.configure(
+                        text=f"并行总吞吐: {total_fps:.1f} FPS | workers: {segment_count} | 完成: {done_count}/{segment_count}"
+                    )
+                    self.control_panel.set_worker_status_text("\n".join(worker_lines))
+                    if not self.control_panel.update():
+                        for worker in workers:
+                            self._terminate_process_tree(worker["process"])
+                            self._close_worker_handles(worker)
+                        return False
+                    if done_count == len(workers):
+                        break
+                    import time
+
+                    time.sleep(0.1)
+
+                for index, worker in enumerate(workers):
+                    worker["process"].wait()
+                    self._close_worker_handles(worker)
+                    if worker["process"].returncode != 0:
+                        stdout_text = self._read_text_if_exists(worker["stdout_path"])
+                        stderr_text = self._read_text_if_exists(worker["stderr_path"])
+                        print(f"Worker W{index + 1} 退出异常，返回码: {worker['process'].returncode}")
+                        if stdout_text:
+                            print(stdout_text)
+                        if stderr_text:
+                            print(stderr_text)
+                        return False
+            finally:
+                for worker in workers:
+                    self._terminate_process_tree(worker.get("process"))
+                    self._close_worker_handles(worker)
+
+            self.control_panel.status_label.configure(
+                text="单文件并行处理中：正在拼接分段结果...", foreground="orange"
+            )
+            self.control_panel.set_worker_status_text(
+                "\n".join(
+                    [f"W{index + 1}: done" for index in range(segment_count)]
+                )
+            )
+            self.control_panel.update()
+            self._concat_processed_segments(segment_outputs, output_path)
+            self.control_panel.status_label.configure(
+                text=f"处理完成！输出: {os.path.basename(output_path)}", foreground="blue"
+            )
+            return True
 
     def _run_roi_model(self, model, rois, **kwargs):
         if not rois:
@@ -1907,6 +2456,8 @@ class RealtimeCascadeDetector:
         reader = VideoReader(video_source, use_gpu=True)
         if not reader.start():
             print(f"无法打开视频源: {video_source}")
+            if hasattr(self.control_panel, "_write_progress"):
+                self.control_panel._write_progress(status="failed")
             return
 
         fps = reader.get_fps()
@@ -2040,6 +2591,8 @@ class RealtimeCascadeDetector:
                 stopped = True
                 break
             ret, frame = reader.read()
+            if ret is None:
+                continue
             if not ret:
                 if self.control_panel.is_stopped():
                     print("用户停止处理")
@@ -2134,6 +2687,8 @@ class RealtimeCascadeDetector:
             self.control_panel.status_label.configure(
                 text="处理已停止，文件已删除", foreground="orange"
             )
+            if hasattr(self.control_panel, "_write_progress"):
+                self.control_panel._write_progress(status="stopped")
             return False
 
         # 最终统计
@@ -2170,6 +2725,8 @@ class RealtimeCascadeDetector:
             self.control_panel.status_label.configure(
                 text="处理失败：ffmpeg 编码失败", foreground="red"
             )
+            if hasattr(self.control_panel, "_write_progress"):
+                self.control_panel._write_progress(status="failed")
             return False
 
         expected_output = output_target
@@ -2179,6 +2736,8 @@ class RealtimeCascadeDetector:
                 text="处理失败：输出视频未生成", foreground="red"
             )
             print(f"输出失败：未生成输出视频 {expected_output}")
+            if hasattr(self.control_panel, "_write_progress"):
+                self.control_panel._write_progress(status="failed")
             return False
 
         # macOS 直接复用单段写入；Windows 保持两段法更稳定
@@ -2193,6 +2752,8 @@ class RealtimeCascadeDetector:
                 self.control_panel.status_label.configure(
                     text="处理失败：音频合并或输出生成失败", foreground="red"
                 )
+                if hasattr(self.control_panel, "_write_progress"):
+                    self.control_panel._write_progress(status="failed")
                 return False
         else:
             os.rename(temp_output, output_path)
@@ -2201,6 +2762,10 @@ class RealtimeCascadeDetector:
         self.control_panel.status_label.configure(
             text=f"处理完成！输出: {os.path.basename(output_path)}", foreground="blue"
         )
+        if hasattr(self.control_panel, "_write_progress"):
+            self.control_panel._write_progress(
+                status="done", current_frame=total_frames, total_frames=total_frames
+            )
         return True
 
     def _process_screen(self, output_path, preview):
@@ -2294,8 +2859,10 @@ class RealtimeCascadeDetector:
                     dir_name = os.path.dirname(video_path)
                     base_name = os.path.splitext(os.path.basename(video_path))[0]
                     output_path = os.path.join(dir_name, f"{base_name}_censored.mp4")
-                self._process_video(video_path, output_path, preview)
-                success = True
+                print(
+                    f"准备处理单文件: {os.path.basename(video_path)} | 并行设置: {self.control_panel.get_parallel_segments()}"
+                )
+                success = self._process_video_parallel_segments(video_path, output_path)
             else:
                 # 多文件或文件夹
                 output_dir = output_base if os.path.isdir(output_base) else "."
@@ -2348,6 +2915,12 @@ class RealtimeCascadeDetector:
 
 
 if __name__ == "__main__":
+    if len(sys.argv) >= 3 and sys.argv[1] == "--worker-payload":
+        with open(sys.argv[2], "r", encoding="utf-8") as payload_file:
+            payload = json.load(payload_file)
+        success = RealtimeCascadeDetector._run_worker_payload(payload)
+        sys.exit(0 if success else 1)
+
     detector = RealtimeCascadeDetector()  # 自动按平台选模型
     #     detector = RealtimeCascadeDetector(
     #     fast_model='models/yolo26n.mlpackage',
