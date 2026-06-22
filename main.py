@@ -12,263 +12,286 @@ import threading
 from Screen_Censor import TransparentProtectionWindow
 
 
+class _WorkerControlPanel:
+    def __init__(self, settings):
+        self.settings = settings
+        self.status_label = self
+
+    def configure(self, **kwargs):
+        return None
+
+    def update(self):
+        return True
+
+    def get_detector_mode(self):
+        return self.settings["detector_mode"]
+
+    def get_nude_model(self):
+        return self.settings["nude_model"]
+
+    def get_censor_mode(self):
+        return self.settings["censor_mode"]
+
+    def get_censor_params(self):
+        return self.settings["censor_params"]
+
+    def get_buffer_frames(self):
+        return self.settings["buffer_frames"]
+
+    def get_genitalia_buffer_frames(self):
+        return self.settings["genitalia_buffer_frames"]
+
+    def should_draw(self, class_name):
+        label_states = self.settings["label_states"]
+        if class_name in label_states:
+            enabled = label_states[class_name]
+            if class_name in ("FACE_FEMALE", "FACE_MALE") and enabled:
+                eye_enabled = label_states.get("eye")
+                if eye_enabled:
+                    return False
+            return enabled
+        return True
+
+
+def _video_reader_target(source, frame_queue, progress_queue, stop_event):
+    import av
+
+    container = None
+    camera = None
+    try:
+        if source == 0:
+            camera = cv2.VideoCapture(0)
+            if not camera.isOpened():
+                raise RuntimeError("Unable to open camera source")
+            frame_index = 0
+            while not stop_event.is_set():
+                ret, frame = camera.read()
+                if not ret:
+                    break
+                frame_queue.put((frame_index, frame), timeout=1.0)
+                frame_index += 1
+                if frame_index % 10 == 0:
+                    progress_queue.put(("read", frame_index))
+        else:
+            container = av.open(str(source), mode="r")
+            video_stream = next((stream for stream in container.streams if stream.type == "video"), None)
+            if video_stream is None:
+                raise RuntimeError("No video stream found")
+            video_stream.thread_type = "AUTO"
+            frame_index = 0
+            for frame in container.decode(video=0):
+                if stop_event.is_set():
+                    break
+                image = frame.to_ndarray(format="bgr24")
+                frame_queue.put((frame_index, image), timeout=1.0)
+                frame_index += 1
+                if frame_index % 10 == 0:
+                    progress_queue.put(("read", frame_index))
+        frame_queue.put(None, timeout=1.0)
+    except Exception as exc:
+        progress_queue.put(("error", "reader", str(exc)))
+        try:
+            frame_queue.put(None, timeout=0.2)
+        except Exception:
+            pass
+    finally:
+        if container is not None:
+            container.close()
+        if camera is not None:
+            camera.release()
+
+
+def _detector_worker_target(frame_queue, annotated_queue, progress_queue, stop_event, settings):
+    detector = RealtimeCascadeDetector()
+    detector.control_panel = _WorkerControlPanel(settings)
+    detector._prepare_detector_for_run()
+
+    processed_count = 0
+    try:
+        while not stop_event.is_set():
+            try:
+                item = frame_queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            if item is None:
+                break
+
+            frame_index, frame = item
+            detections = detector._detect_frame(frame)
+            annotated = detector.draw_results(frame, detections)
+            annotated_queue.put((frame_index, annotated), timeout=1.0)
+
+            processed_count += 1
+            if processed_count % 10 == 0:
+                progress_queue.put(("processed", processed_count))
+
+        annotated_queue.put(None, timeout=1.0)
+        progress_queue.put(("worker_done", processed_count))
+    except Exception as exc:
+        progress_queue.put(("error", "worker", str(exc)))
+        try:
+            annotated_queue.put(None, timeout=0.2)
+        except Exception:
+            pass
+
+
+def _video_writer_target(output_path, annotated_queue, progress_queue, stop_event, settings):
+    import av
+    from fractions import Fraction
+    import traceback
+
+    container = None
+    try:
+        container = av.open(str(output_path), mode="w")
+        fps_value = settings["fps"] if settings["fps"] > 0 else 30.0
+        fps_rate = Fraction(str(fps_value)).limit_denominator(1000)
+        stream = container.add_stream("libx264", rate=fps_rate)
+        stream.width = settings["width"]
+        stream.height = settings["height"]
+        stream.pix_fmt = "yuv420p"
+
+        target_size = settings["target_size_mb"]
+        duration = settings["duration"]
+        if target_size > 0 and duration > 0:
+            target_bitrate_kbps = (target_size * 8 * 1024) / duration
+            stream.bit_rate = int(target_bitrate_kbps * 1000 * 0.9)
+        else:
+            stream.options = {"preset": "medium", "crf": "23"}
+
+        written_count = 0
+        while not stop_event.is_set():
+            try:
+                item = annotated_queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            if item is None:
+                break
+
+            frame_index, frame = item
+            if frame.shape[1] != settings["width"] or frame.shape[0] != settings["height"]:
+                frame = cv2.resize(frame, (settings["width"], settings["height"]))
+
+            video_frame = av.VideoFrame.from_ndarray(frame, format="bgr24")
+            for packet in stream.encode(video_frame):
+                container.mux(packet)
+
+            written_count += 1
+            if written_count % 10 == 0:
+                progress_queue.put(("written", written_count, frame_index))
+
+        for packet in stream.encode():
+            container.mux(packet)
+
+        progress_queue.put(("writer_done", written_count))
+    except Exception as exc:
+        progress_queue.put(("error", "writer", f"{exc}\n{traceback.format_exc()}"))
+    finally:
+        if container is not None:
+            container.close()
+
+
 class VideoReader:
     def __init__(self, source, queue_size=4, use_gpu=False):
         self.source = source
-        self.queue = queue.Queue(maxsize=queue_size)
-        self.thread = None
-        self.running = False
-        self.cap = None
-        self.proc = None
-        self.ret = False
-        self.frame = None
+        self.queue_size = queue_size
         self.use_gpu = use_gpu and source != 0
-        self.gpu_fallback_reason = None
+        self.cap = None
+        self.container = None
+        self.decode_iter = None
+        self.video_stream = None
+        self.width = 0
+        self.height = 0
+        self.fps = 30.0
+        self.frame_count = 0
+        self.duration = 0.0
+        self.has_audio = False
 
     @staticmethod
-    def _supports_cuvid():
-        return platform.system() == "Windows"
-
-    @staticmethod
-    def _parse_fps(fps_text):
-        if not fps_text or fps_text == "0/0":
+    def _parse_rate(rate):
+        if rate is None:
             return 0.0
-        if "/" in fps_text:
-            num, den = fps_text.split("/", 1)
-            den_value = float(den)
-            if den_value == 0:
-                return 0.0
-            return float(num) / den_value
-        return float(fps_text)
-
-    def _probe_video_info(self):
         try:
-            result = subprocess.run(
-                [
-                    "ffprobe",
-                    "-v",
-                    "error",
-                    "-select_streams",
-                    "v:0",
-                    "-show_entries",
-                    "stream=codec_name,width,height,avg_frame_rate,nb_frames",
-                    "-show_entries",
-                    "format=duration",
-                    "-of",
-                    "default=noprint_wrappers=1:nokey=0",
-                    str(self.source),
-                ],
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
+            return float(rate)
         except Exception:
-            return False
+            return 0.0
 
-        info = {}
-        for line in result.stdout.splitlines():
-            if "=" not in line:
-                continue
-            key, value = line.split("=", 1)
-            info[key.strip()] = value.strip()
+    def start(self):
+        import av
 
-        self.codec_name = info.get("codec_name", "")
-        self.width = int(info.get("width", "0") or 0)
-        self.height = int(info.get("height", "0") or 0)
-        self.fps = self._parse_fps(info.get("avg_frame_rate", "0/0"))
-        duration = float(info.get("duration", "0") or 0)
-        nb_frames = info.get("nb_frames", "0")
-        if nb_frames.isdigit():
-            self.frame_count = int(nb_frames)
-        elif duration > 0 and self.fps > 0:
-            self.frame_count = int(duration * self.fps)
-        else:
-            self.frame_count = 0
-        return self.width > 0 and self.height > 0
-
-    def _start_cpu_capture(self):
         if self.source == 0:
             self.cap = cv2.VideoCapture(0)
             if not self.cap.isOpened():
                 return False
+            self.width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            self.height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            self.fps = self.cap.get(cv2.CAP_PROP_FPS) or 30.0
+            self.frame_count = 0
+            self.duration = 0.0
+            self.has_audio = False
             return True
 
-        self.use_gpu = False
-        return self._probe_video_info()
+        self.container = av.open(str(self.source), mode="r")
+        self.video_stream = next((stream for stream in self.container.streams if stream.type == "video"), None)
+        if self.video_stream is None:
+            self.stop()
+            return False
 
-    def _fallback_to_cpu(self, reason, existing_cap=None):
-        self.gpu_fallback_reason = reason
-        print(f"GPU decode unavailable for this file, falling back to ffmpeg CPU decode: {reason}")
-        self.use_gpu = False
-        if existing_cap is not None:
-            self.cap = existing_cap
-            return self.cap.isOpened()
-        return self._start_cpu_capture()
-
-    def _reader_loop(self):
-        if self.use_gpu:
-            self._gpu_reader_loop()
-        else:
-            self._cpu_reader_loop()
-
-    def _cpu_reader_loop(self):
-        if self.source != 0:
-            self._ffmpeg_reader_loop()
-            return
-
-        while self.running:
-            if self.cap is None:
-                break
-            ret, frame = self.cap.read()
-            if not ret:
-                self.queue.put((None, None))
-                break
-            self.queue.put((ret, frame.copy()))
-
-    def _ffmpeg_reader_loop(self, decoder=None):
-        cmd = ["ffmpeg"]
-        if decoder:
-            cmd.extend(["-c:v", decoder])
-        cmd.extend([
-            "-i",
-            str(self.source),
-            "-f",
-            "rawvideo",
-            "-pix_fmt",
-            "bgr24",
-            "-",
-        ])
-
-        try:
-            self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-            frame_size = self.width * self.height * 3
-            if frame_size <= 0:
-                raise ValueError(f"invalid frame size {self.width}x{self.height}")
-            while self.running:
-                raw = bytearray()
-                while len(raw) < frame_size:
-                    chunk = self.proc.stdout.read(frame_size - len(raw))
-                    if not chunk:
-                        break
-                    raw.extend(chunk)
-                if len(raw) < frame_size:
-                    break
-                frame = np.frombuffer(raw, dtype=np.uint8).reshape((self.height, self.width, 3)).copy()
-                self.queue.put((True, frame))
-        except Exception as e:
-            mode = "GPU" if decoder else "CPU"
-            print(f"{mode} decode error: {e}")
-        finally:
-            if self.proc:
-                self.proc.terminate()
-                self.proc = None
-            self.queue.put((False, None))
-
-    def _get_cuvid_decoder(self, source):
-        try:
-            result = subprocess.run(
-                ["ffprobe", "-v", "error", "-select_streams", "v:0", 
-                 "-show_entries", "stream=codec_name", "-of", "csv=p=0", str(source)],
-                capture_output=True, text=True, timeout=5
-            )
-            codec = result.stdout.strip().lower()
-            if codec in ("hevc", "h265"):
-                return "hevc_cuvid"
-            return "h264_cuvid"
-        except:
-            return "h264_cuvid"
-
-    def _gpu_reader_loop(self):
-        cuvid = self._get_cuvid_decoder(self.source)
-        self._ffmpeg_reader_loop(decoder=cuvid)
-
-    def start(self):
-        if self.source == 0:
-            self.use_gpu = False
-            if not self._start_cpu_capture():
-                return False
-        elif self.use_gpu:
-            if not self._supports_cuvid():
-                if not self._fallback_to_cpu("cuvid decode is unavailable on this platform"):
-                    return False
-            if not self._probe_video_info():
-                if not self._fallback_to_cpu("ffprobe failed to read video dimensions"):
-                    return False
-            if self.fps <= 0:
-                self.fps = 30.0
-        else:
-            if not self._start_cpu_capture():
-                return False
-
-        self.running = True
-        self.thread = threading.Thread(target=self._reader_loop, daemon=True)
-        self.thread.start()
-        return True
+        self.video_stream.thread_type = "AUTO"
+        self.width = int(self.video_stream.codec_context.width or self.video_stream.width or 0)
+        self.height = int(self.video_stream.codec_context.height or self.video_stream.height or 0)
+        self.fps = self._parse_rate(self.video_stream.average_rate or self.video_stream.base_rate) or 30.0
+        self.frame_count = int(self.video_stream.frames or 0)
+        self.duration = float(self.container.duration / av.time_base) if self.container.duration else 0.0
+        if self.frame_count <= 0 and self.duration > 0 and self.fps > 0:
+            self.frame_count = int(self.duration * self.fps)
+        self.has_audio = any(stream.type == "audio" for stream in self.container.streams)
+        self.decode_iter = self.container.decode(video=0)
+        return self.width > 0 and self.height > 0
 
     def read(self):
-        try:
-            timeout = 0.5 if self.source != 0 else 0.2
-            self.ret, self.frame = self.queue.get(timeout=timeout)
-            return self.ret, self.frame
-        except queue.Empty:
+        if self.source == 0:
+            if self.cap is None:
+                return False, None
+            return self.cap.read()
+
+        if self.decode_iter is None:
             return False, None
 
+        try:
+            frame = next(self.decode_iter)
+        except StopIteration:
+            return False, None
+        except Exception:
+            return False, None
+        return True, frame.to_ndarray(format="bgr24")
+
     def stop(self):
-        self.running = False
-        if self.thread:
-            self.thread.join(timeout=1.0)
-        if self.proc:
-            self.proc.terminate()
-            self.proc = None
-        if self.cap:
+        if self.cap is not None:
             self.cap.release()
             self.cap = None
+        self.decode_iter = None
+        self.video_stream = None
+        if self.container is not None:
+            self.container.close()
+            self.container = None
 
     def force_stop(self):
-        self.running = False
-        if self.proc:
-            self.proc.terminate()
-            self.proc = None
-        if self.cap:
-            self.cap.release()
-            self.cap = None
-        if self.thread and self.thread.is_alive():
-            self.thread.join(timeout=0.2)
+        self.stop()
 
     def get_fps(self):
-        if self.use_gpu or self.cap is None:
-            return getattr(self, 'fps', 30.0)
-        if self.cap:
-            return self.cap.get(cv2.CAP_PROP_FPS)
-        return 30.0
+        return self.fps or 30.0
 
     def get_frame_count(self):
-        if self.use_gpu or self.cap is None:
-            return getattr(self, 'frame_count', 0)
-        if self.cap:
-            return int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        return 0
+        return self.frame_count
 
     def get_width(self):
-        if self.use_gpu or self.cap is None:
-            return getattr(self, 'width', 0)
-        if self.cap:
-            return int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        return 0
+        return self.width
 
     def get_height(self):
-        if self.use_gpu or self.cap is None:
-            return getattr(self, 'height', 0)
-        if self.cap:
-            return int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        return 0
+        return self.height
 
     def is_opened(self):
-        return (
-            (self.cap is not None and self.cap.isOpened())
-            or self.proc is not None
-            or (self.source != 0 and getattr(self, 'width', 0) > 0 and getattr(self, 'height', 0) > 0)
-        )
+        return (self.cap is not None and self.cap.isOpened()) or self.container is not None
 
 
 class DetectionControlPanel:
@@ -693,6 +716,7 @@ class DetectionControlPanel:
                 text="请先选择有效的视频文件！", foreground="red"
             )
             return
+        self._last_process_error = None
         self._started = True
         self._stopped = False
         self.start_btn.configure(text="●  检测中...", state="disabled")
@@ -995,7 +1019,7 @@ class RealtimeCascadeDetector:
         self.pose_model = None
 
         self.nude_imgsz = {"320": (320, 192), "640m": (640, 384)}
-        self.pose_imgsz = 640
+        self.pose_imgsz = 320
         self.fast_model_warmed = False
         self.eye_model_warmed = False
         self.nudenet_model_warmed = set()
@@ -1380,80 +1404,133 @@ class RealtimeCascadeDetector:
             }
         )
 
+    @staticmethod
+    def _offset_pose_points(points, offset_x, offset_y):
+        if not points:
+            return points
+
+        adjusted = {}
+        for name, (x_coord, y_coord, confidence) in points.items():
+            adjusted[name] = (x_coord + offset_x, y_coord + offset_y, confidence)
+        return adjusted
+
     def _detect_with_pose(self, frame):
         frame_height, frame_width = frame.shape[:2]
         pose_model = self._get_pose_model()
-        results = pose_model(frame, conf=0.25, imgsz=self.pose_imgsz, verbose=False)
-        if not results:
-            return []
-
-        keypoints = getattr(results[0], "keypoints", None)
-        if keypoints is None or keypoints.xy is None:
-            return []
-
-        boxes = results[0].boxes
-        keypoints_xy = keypoints.xy.cpu().numpy()
-        keypoints_conf = keypoints.conf.cpu().numpy() if keypoints.conf is not None else None
         final_detections = []
 
-        for person_idx, person_points in enumerate(keypoints_xy):
-            point_conf = keypoints_conf[person_idx] if keypoints_conf is not None else None
-            points = self._extract_pose_points(person_points, point_conf)
-            if not points:
-                continue
-            confidence = 0.5
-            if boxes is not None and len(boxes) > person_idx:
-                confidence = float(boxes[person_idx].conf[0])
+        results_fast = self.fast_model(frame, conf=0.3, classes=[0], verbose=False)
+        candidates = []
+        for box in results_fast[0].boxes:
+            x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+            pad = 50
+            x1 = max(0, x1 - pad)
+            y1 = max(0, y1 - pad)
+            x2 = min(frame_width, x2 + pad)
+            y2 = min(frame_height, y2 + pad)
+            candidates.append((x1, y1, x2, y2))
 
-            self._append_pose_detection(
-                final_detections,
-                self._build_pose_face_bbox(points, frame_width, frame_height),
-                "FACE_FEMALE",
-                confidence,
-                person_idx,
+        if not candidates:
+            return final_detections
+
+        person_rois = []
+        person_roi_data = []
+        for x1, y1, x2, y2 in candidates:
+            roi = frame[y1:y2, x1:x2]
+            if roi.size == 0:
+                continue
+            person_rois.append(roi)
+            person_roi_data.append((x1, y1, x2, y2))
+
+        batch_size = 2
+        global_person_idx = 0
+        for batch_start in range(0, len(person_rois), batch_size):
+            batch_end = min(batch_start + batch_size, len(person_rois))
+            batch_rois = person_rois[batch_start:batch_end]
+            batch_roi_data = person_roi_data[batch_start:batch_end]
+            pose_results = self._run_roi_model(
+                pose_model,
+                batch_rois,
+                conf=0.25,
+                imgsz=self.pose_imgsz,
+                verbose=False,
             )
-            self._append_pose_detection(
-                final_detections,
-                self._build_pose_eye_bbox(points, frame_width, frame_height),
-                "eye",
-                confidence,
-                person_idx,
-            )
-            self._append_pose_detection(
-                final_detections,
-                self._build_pose_breast_bbox(points, frame_width, frame_height),
-                "FEMALE_BREAST_COVERED",
-                confidence,
-                person_idx,
-            )
-            self._append_pose_detection(
-                final_detections,
-                self._build_pose_belly_bbox(points, frame_width, frame_height),
-                "BELLY_COVERED",
-                confidence,
-                person_idx,
-            )
-            self._append_pose_detection(
-                final_detections,
-                self._build_pose_genitalia_bbox(points, frame_width, frame_height),
-                "FEMALE_GENITALIA_COVERED",
-                confidence,
-                person_idx,
-            )
-            self._append_pose_detection(
-                final_detections,
-                self._build_pose_buttocks_bbox(points, frame_width, frame_height),
-                "BUTTOCKS_COVERED",
-                confidence,
-                person_idx,
-            )
-            self._append_pose_detection(
-                final_detections,
-                self._build_pose_feet_bbox(points, frame_width, frame_height),
-                "FEET_COVERED",
-                confidence,
-                person_idx,
-            )
+
+            for result_index, result in enumerate(pose_results):
+                roi_x1, roi_y1, _, _ = batch_roi_data[result_index]
+                keypoints = getattr(result, "keypoints", None)
+                if keypoints is None or keypoints.xy is None:
+                    continue
+
+                boxes = result.boxes
+                keypoints_xy = keypoints.xy.cpu().numpy()
+                keypoints_conf = (
+                    keypoints.conf.cpu().numpy() if keypoints.conf is not None else None
+                )
+
+                for local_person_index, person_points in enumerate(keypoints_xy):
+                    point_conf = (
+                        keypoints_conf[local_person_index] if keypoints_conf is not None else None
+                    )
+                    points = self._extract_pose_points(person_points, point_conf)
+                    if not points:
+                        continue
+
+                    points = self._offset_pose_points(points, roi_x1, roi_y1)
+                    confidence = 0.5
+                    if boxes is not None and len(boxes) > local_person_index:
+                        confidence = float(boxes[local_person_index].conf[0])
+
+                    self._append_pose_detection(
+                        final_detections,
+                        self._build_pose_face_bbox(points, frame_width, frame_height),
+                        "FACE_FEMALE",
+                        confidence,
+                        global_person_idx,
+                    )
+                    self._append_pose_detection(
+                        final_detections,
+                        self._build_pose_eye_bbox(points, frame_width, frame_height),
+                        "eye",
+                        confidence,
+                        global_person_idx,
+                    )
+                    self._append_pose_detection(
+                        final_detections,
+                        self._build_pose_breast_bbox(points, frame_width, frame_height),
+                        "FEMALE_BREAST_COVERED",
+                        confidence,
+                        global_person_idx,
+                    )
+                    self._append_pose_detection(
+                        final_detections,
+                        self._build_pose_belly_bbox(points, frame_width, frame_height),
+                        "BELLY_COVERED",
+                        confidence,
+                        global_person_idx,
+                    )
+                    self._append_pose_detection(
+                        final_detections,
+                        self._build_pose_genitalia_bbox(points, frame_width, frame_height),
+                        "FEMALE_GENITALIA_COVERED",
+                        confidence,
+                        global_person_idx,
+                    )
+                    self._append_pose_detection(
+                        final_detections,
+                        self._build_pose_buttocks_bbox(points, frame_width, frame_height),
+                        "BUTTOCKS_COVERED",
+                        confidence,
+                        global_person_idx,
+                    )
+                    self._append_pose_detection(
+                        final_detections,
+                        self._build_pose_feet_bbox(points, frame_width, frame_height),
+                        "FEET_COVERED",
+                        confidence,
+                        global_person_idx,
+                    )
+                    global_person_idx += 1
 
         return final_detections
 
@@ -1794,6 +1871,8 @@ class RealtimeCascadeDetector:
 
     def _merge_audio(self, video_source, temp_video, output_path):
         """用 ffmpeg 将原视频的音频合并到输出视频（视频流直接 copy）"""
+        import time
+
         if not os.path.exists(temp_video):
             print(f"音频合并跳过：未找到临时视频 {temp_video}")
             return False
@@ -1821,6 +1900,9 @@ class RealtimeCascadeDetector:
             merge_cmd = [
                 "ffmpeg",
                 "-y",
+                "-loglevel",
+                "error",
+                "-nostats",
                 "-i",
                 temp_video,
                 "-i",
@@ -1828,7 +1910,7 @@ class RealtimeCascadeDetector:
                 "-c:v",
                 "copy",
                 "-c:a",
-                "aac",
+                "copy",
                 "-map",
                 "0:v",
                 "-map",
@@ -1838,17 +1920,37 @@ class RealtimeCascadeDetector:
             ]
 
             print("正在合并音频...")
-            subprocess.run(merge_cmd, capture_output=True, check=True)
+            merge_proc = subprocess.Popen(
+                merge_cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+            while True:
+                return_code = merge_proc.poll()
+                if return_code is not None:
+                    if return_code != 0:
+                        stderr_output = (
+                            merge_proc.stderr.read().decode(errors="replace")
+                            if merge_proc.stderr
+                            else ""
+                        )
+                        raise subprocess.CalledProcessError(
+                            return_code,
+                            merge_cmd,
+                            stderr=stderr_output.encode(),
+                        )
+                    break
+                if self.control_panel is not None:
+                    self.control_panel.update()
+                time.sleep(0.05)
+            if merge_proc.stderr:
+                merge_proc.stderr.close()
             print(f"音频合并完成: {output_path}")
             return True
 
         except subprocess.CalledProcessError as e:
             print(f"音频合并失败: {e.stderr.decode() if e.stderr else str(e)}")
-            if os.path.exists(temp_video):
-                os.rename(temp_video, output_path)
-                print(f"无声视频已保存为: {output_path}")
-                return True
-            print("音频合并失败，且无声临时视频不存在")
+            print("音频合并失败，保留无声临时视频供排查")
             return False
 
     def _source_has_audio(self, video_source):
@@ -1876,6 +1978,183 @@ class RealtimeCascadeDetector:
     def _process_video(self, video_source, output_path, preview):
         """处理单个视频，返回是否正常完成"""
         import time
+        import multiprocessing as mp
+
+        if platform.system() == "Windows":
+            self._prepare_detector_for_run()
+
+            reader = VideoReader(video_source, use_gpu=True)
+            if not reader.start():
+                print(f"无法打开视频源: {video_source}")
+                return False
+
+            fps = reader.get_fps()
+            total_frames = reader.get_frame_count()
+            orig_width = reader.get_width()
+            orig_height = reader.get_height()
+            duration = reader.duration if getattr(reader, "duration", 0) else 0.0
+            target_size = self.control_panel.get_target_size_mb()
+            downscale_720p = self.control_panel.get_downscale_720p()
+            if downscale_720p:
+                target_height = 720
+                target_width = int(orig_width * (target_height / orig_height))
+                target_width = (target_width // 2) * 2
+                target_height = (target_height // 2) * 2
+            else:
+                target_width = orig_width
+                target_height = orig_height
+
+            temp_output = output_path.replace(".mp4", "_noaudio.mp4")
+            settings = {
+                "width": target_width,
+                "height": target_height,
+                "fps": fps,
+                "duration": duration,
+                "target_size_mb": target_size,
+                "detector_mode": self.control_panel.get_detector_mode(),
+                "nude_model": self.control_panel.get_nude_model(),
+                "censor_mode": self.control_panel.get_censor_mode(),
+                "censor_params": self.control_panel.get_censor_params(),
+                "buffer_frames": self.control_panel.get_buffer_frames(),
+                "genitalia_buffer_frames": self.control_panel.get_genitalia_buffer_frames(),
+                "label_states": {
+                    label: var.get() for label, var in self.control_panel._label_vars.items()
+                },
+            }
+
+            ctx = mp.get_context("spawn")
+            frame_queue = ctx.Queue(maxsize=8)
+            annotated_queue = ctx.Queue(maxsize=8)
+            progress_queue = ctx.Queue()
+            stop_event = ctx.Event()
+
+            reader_process = ctx.Process(
+                target=_video_reader_target,
+                args=(video_source, frame_queue, progress_queue, stop_event),
+                daemon=True,
+            )
+            worker_process = ctx.Process(
+                target=_detector_worker_target,
+                args=(frame_queue, annotated_queue, progress_queue, stop_event, settings),
+                daemon=True,
+            )
+            writer_process = ctx.Process(
+                target=_video_writer_target,
+                args=(temp_output, annotated_queue, progress_queue, stop_event, settings),
+                daemon=True,
+            )
+
+            reader.stop()
+            reader_process.start()
+            worker_process.start()
+            writer_process.start()
+
+            last_written = 0
+            current_fps = 0.0
+            fps_start_time = time.time()
+            processed_since_tick = 0
+            worker_done = False
+            writer_done = False
+            failed = False
+            failure_text = ""
+
+            try:
+                while True:
+                    if self.control_panel.is_stopped():
+                        stop_event.set()
+                        break
+
+                    try:
+                        message = progress_queue.get(timeout=0.1)
+                    except queue.Empty:
+                        message = None
+
+                    if message is not None:
+                        kind = message[0]
+                        if kind == "error":
+                            failed = True
+                            failure_text = f"{message[1]}: {message[2]}"
+                            print(f"Windows pipeline error - {failure_text}")
+                            stop_event.set()
+                            break
+                        if kind == "written":
+                            _, written_count, frame_index = message
+                            last_written = frame_index + 1
+                            processed_since_tick += 10
+                            elapsed = time.time() - fps_start_time
+                            if elapsed > 0:
+                                current_fps = processed_since_tick / elapsed
+                                self.control_panel.update_fps(current_fps)
+                                self.control_panel.update_frame_count(last_written, total_frames)
+                                fps_start_time = time.time()
+                                processed_since_tick = 0
+                        elif kind == "worker_done":
+                            worker_done = True
+                        elif kind == "writer_done":
+                            writer_done = True
+
+                    if worker_done and writer_done:
+                        break
+
+                    self.control_panel.update()
+            finally:
+                stop_event.set()
+                for process in (reader_process, worker_process, writer_process):
+                    process.join(timeout=1.0)
+                    if process.is_alive():
+                        process.terminate()
+                        process.join(timeout=1.0)
+                self.control_panel.update()
+
+            if self.control_panel.is_stopped():
+                if os.path.exists(temp_output):
+                    os.remove(temp_output)
+                if os.path.exists(output_path):
+                    os.remove(output_path)
+                self.control_panel._last_process_error = "处理已停止，文件已删除"
+                self.control_panel.status_label.configure(
+                    text="处理已停止，文件已删除", foreground="orange"
+                )
+                return False
+
+            if failed:
+                if os.path.exists(temp_output):
+                    os.remove(temp_output)
+                self.control_panel._last_process_error = f"处理失败：{failure_text}"
+                self.control_panel.status_label.configure(
+                    text=f"处理失败：{failure_text}", foreground="red"
+                )
+                return False
+
+            if not os.path.exists(temp_output):
+                self.control_panel._last_process_error = "处理失败：输出视频未生成"
+                self.control_panel.status_label.configure(
+                    text="处理失败：输出视频未生成", foreground="red"
+                )
+                return False
+
+            source_has_audio = self.has_ffmpeg and self._source_has_audio(video_source)
+            if source_has_audio and video_source != 0:
+                self.control_panel.status_label.configure(
+                    text="视频处理完成，正在合并音频...", foreground="orange"
+                )
+                self.control_panel.update()
+                merged = self._merge_audio(video_source, temp_output, output_path)
+                if merged and os.path.exists(temp_output):
+                    os.remove(temp_output)
+                if not merged:
+                    self.control_panel._last_process_error = "处理失败：音频合并失败，已保留无声视频"
+                    self.control_panel.status_label.configure(
+                        text="处理失败：音频合并失败，已保留无声视频", foreground="red"
+                    )
+                    return False
+            else:
+                os.rename(temp_output, output_path)
+
+            self.control_panel.status_label.configure(
+                text=f"处理完成！输出: {os.path.basename(output_path)}", foreground="blue"
+            )
+            return True
 
         self._prepare_detector_for_run()
 
@@ -1930,6 +2209,9 @@ class RealtimeCascadeDetector:
         ffmpeg_cmd = [
             "ffmpeg",
             "-y",
+            "-loglevel",
+            "error",
+            "-nostats",
             "-f",
             "rawvideo",
             "-vcodec",
@@ -2112,7 +2394,16 @@ class RealtimeCascadeDetector:
         reader.stop()
         if ffmpeg_proc.stdin and not ffmpeg_proc.stdin.closed:
             ffmpeg_proc.stdin.close()
-        ffmpeg_return_code = ffmpeg_proc.wait()
+        while True:
+            ffmpeg_return_code = ffmpeg_proc.poll()
+            if ffmpeg_return_code is not None:
+                break
+            if self.control_panel is not None:
+                self.control_panel.status_label.configure(
+                    text="视频处理完成，正在写入输出文件...", foreground="orange"
+                )
+                self.control_panel.update()
+            time.sleep(0.05)
         if not ffmpeg_failed and ffmpeg_return_code != 0:
             ffmpeg_failed = True
             ffmpeg_error = ffmpeg_proc.stderr.read().decode(errors="replace") if ffmpeg_proc.stderr else ""
@@ -2130,6 +2421,7 @@ class RealtimeCascadeDetector:
                 os.remove(output_target)
             if os.path.exists(temp_output):
                 os.remove(temp_output)
+            self.control_panel._last_process_error = "处理失败：ffmpeg 编码失败"
             self.control_panel.status_label.configure(
                 text="处理失败：ffmpeg 编码失败", foreground="red"
             )
@@ -2138,6 +2430,7 @@ class RealtimeCascadeDetector:
         expected_output = output_target
 
         if not os.path.exists(expected_output):
+            self.control_panel._last_process_error = "处理失败：输出视频未生成"
             self.control_panel.status_label.configure(
                 text="处理失败：输出视频未生成", foreground="red"
             )
@@ -2149,12 +2442,17 @@ class RealtimeCascadeDetector:
             if os.path.exists(temp_output):
                 os.remove(temp_output)
         elif source_has_audio and self.has_ffmpeg and video_source != 0:
+            self.control_panel.status_label.configure(
+                text="视频处理完成，正在合并音频...", foreground="orange"
+            )
+            self.control_panel.update()
             merged = self._merge_audio(video_source, temp_output, output_path)
-            if os.path.exists(temp_output):
+            if merged and os.path.exists(temp_output):
                 os.remove(temp_output)
             if not merged:
+                self.control_panel._last_process_error = "处理失败：音频合并失败，已保留无声视频"
                 self.control_panel.status_label.configure(
-                    text="处理失败：音频合并或输出生成失败", foreground="red"
+                    text="处理失败：音频合并失败，已保留无声视频", foreground="red"
                 )
                 return False
         else:
@@ -2242,12 +2540,10 @@ class RealtimeCascadeDetector:
             # 判断处理模式
             if video_sources == [0]:
                 # 摄像头模式
-                self._process_video(0, "camera_output.mp4", preview)
-                success = True
+                success = self._process_video(0, "camera_output.mp4", preview)
             elif video_sources == ["screen"]:
                 # 屏幕捕获模式
-                self._process_screen(output_base, preview)
-                success = True
+                success = self._process_screen(output_base, preview)
             elif len(video_sources) == 1:
                 # 单文件
                 video_path = video_sources[0]
@@ -2257,11 +2553,11 @@ class RealtimeCascadeDetector:
                     dir_name = os.path.dirname(video_path)
                     base_name = os.path.splitext(os.path.basename(video_path))[0]
                     output_path = os.path.join(dir_name, f"{base_name}_censored.mp4")
-                self._process_video(video_path, output_path, preview)
-                success = True
+                success = self._process_video(video_path, output_path, preview)
             else:
                 # 多文件或文件夹
                 output_dir = output_base if os.path.isdir(output_base) else "."
+                success = True
                 for i, video_source in enumerate(video_sources):
                     base_name = os.path.splitext(os.path.basename(video_source))[0]
                     output_path = os.path.join(output_dir, f"{base_name}_censored.mp4")
@@ -2274,12 +2570,12 @@ class RealtimeCascadeDetector:
                         foreground="orange",
                     )
                     self.control_panel.update()
-                    self._process_video(
+                    item_success = self._process_video(
                         video_source,
                         output_path,
                         preview and i == len(video_sources) - 1,
                     )
-                success = True
+                    success = success and bool(item_success)
 
             # 恢复 GUI 状态
             self.control_panel._started = False
@@ -2292,7 +2588,7 @@ class RealtimeCascadeDetector:
                     text=f"处理完成！共处理 {len(video_sources) if video_sources and video_sources[0] != 0 else 0} 个视频 | 可重新选择视频并开始",
                     foreground="blue",
                 )
-            else:
+            elif not getattr(self.control_panel, "_last_process_error", None):
                 self.control_panel.status_label.configure(
                     text=f"无法打开视频源", foreground="red"
                 )
