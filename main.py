@@ -207,7 +207,7 @@ class VideoReader:
 
     def read(self):
         try:
-            timeout = 5.0 if self.source != 0 else 1.0
+            timeout = 0.5 if self.source != 0 else 0.2
             self.ret, self.frame = self.queue.get(timeout=timeout)
             return self.ret, self.frame
         except queue.Empty:
@@ -223,6 +223,17 @@ class VideoReader:
         if self.cap:
             self.cap.release()
             self.cap = None
+
+    def force_stop(self):
+        self.running = False
+        if self.proc:
+            self.proc.terminate()
+            self.proc = None
+        if self.cap:
+            self.cap.release()
+            self.cap = None
+        if self.thread and self.thread.is_alive():
+            self.thread.join(timeout=0.2)
 
     def get_fps(self):
         if self.use_gpu or self.cap is None:
@@ -965,7 +976,7 @@ class RealtimeCascadeDetector:
             self.fast_model = YOLO(
                 fast_model or "models/yolo26n.mlpackage", task="detect"
             )
-            self.pose_model = YOLO("models/yolo26n-pose.mlpackage", task="pose")
+            self.pose_model_path = "models/yolo26n-pose.mlpackage"
             self.precise_models = {
                 "320": YOLO("models/nudenet_320n.mlpackage", task="detect"),
                 "640m": YOLO("models/nudenet_640m.mlpackage", task="detect"),
@@ -974,15 +985,21 @@ class RealtimeCascadeDetector:
         else:  # Windows
             self.device = "cuda"
             self.fast_model = YOLO(fast_model or "models/yolo26n.engine", task="detect")
-            self.pose_model = YOLO("models/yolo26n-pose.pt", task="pose")
+            self.pose_model_path = "models/yolo26n-pose.engine"
             self.precise_models = {
                 "320": YOLO("models/nudenet_320n.engine", task="detect"),
                 "640m": YOLO("models/nudenet_640m.engine", task="detect"),
             }
             self.eye_model = YOLO("models/face-parts-yolov8n.engine", task="detect")
 
+        self.pose_model = None
+
         self.nude_imgsz = {"320": (320, 192), "640m": (640, 384)}
         self.pose_imgsz = 640
+        self.fast_model_warmed = False
+        self.eye_model_warmed = False
+        self.nudenet_model_warmed = set()
+        self.pose_model_warmed = False
         self.pose_keypoints = {
             "nose": 0,
             "left_eye": 1,
@@ -1066,6 +1083,81 @@ class RealtimeCascadeDetector:
         if platform.system() == "Darwin":
             return [model(roi, **kwargs)[0] for roi in rois]
         return model(rois, **kwargs)
+
+    def _get_pose_model(self):
+        if self.pose_model is None:
+            print(f"Loading {self.pose_model_path} for pose inference...")
+            self.pose_model = YOLO(self.pose_model_path, task="pose")
+        return self.pose_model
+
+    def _warm_model(self, model, frame, **kwargs):
+        model(frame, verbose=False, **kwargs)
+
+    def _warm_fast_model(self):
+        if self.fast_model_warmed:
+            return
+        print("Warming up fast detection model...")
+        warmup_frame = np.zeros((640, 640, 3), dtype=np.uint8)
+        self._warm_model(self.fast_model, warmup_frame, conf=0.3, classes=[0])
+        self.fast_model_warmed = True
+
+    def _warm_eye_model(self):
+        if self.eye_model_warmed:
+            return
+        print("Warming up eye model...")
+        warmup_frame = np.zeros((320, 320, 3), dtype=np.uint8)
+        self._warm_model(self.eye_model, warmup_frame, conf=0.2, imgsz=320, rect=False)
+        self.eye_model_warmed = True
+
+    def _warm_selected_nudenet_model(self):
+        model_key = self.control_panel.get_nude_model() if self.control_panel else "640m"
+        if model_key in self.nudenet_model_warmed:
+            return
+        precise_model, nude_imgsz = self.get_nude_model_and_imgsz()
+        print(f"Warming up NudeNet model: {model_key}...")
+        warmup_frame = np.zeros((nude_imgsz[1], nude_imgsz[0], 3), dtype=np.uint8)
+        if platform.system() == "Darwin":
+            precise_model(warmup_frame, conf=0.2, imgsz=nude_imgsz, rect=False, verbose=False)
+        else:
+            precise_model([warmup_frame], conf=0.2, imgsz=nude_imgsz, rect=False, verbose=False)
+        self.nudenet_model_warmed.add(model_key)
+
+    def _warm_pose_model(self):
+        if self.pose_model_warmed:
+            return
+        pose_model = self._get_pose_model()
+        print("Warming up pose model...")
+        warmup_frame = np.zeros((self.pose_imgsz, self.pose_imgsz, 3), dtype=np.uint8)
+        pose_model(warmup_frame, conf=0.25, imgsz=self.pose_imgsz, verbose=False)
+        self.pose_model_warmed = True
+
+    def _prepare_detector_for_run(self):
+        if not self.control_panel:
+            return
+
+        detector_mode = self.control_panel.get_detector_mode()
+
+        if hasattr(self.control_panel, "status_label"):
+            self.control_panel.status_label.configure(
+                text="正在初始化检测模型...", foreground="orange"
+            )
+        if hasattr(self.control_panel, "update"):
+            self.control_panel.update()
+
+        self._warm_fast_model()
+
+        if detector_mode == "pose":
+            self._warm_pose_model()
+        else:
+            self._warm_selected_nudenet_model()
+            self._warm_eye_model()
+
+        if hasattr(self.control_panel, "status_label"):
+            self.control_panel.status_label.configure(
+                text="模型初始化完成，开始处理...", foreground="green"
+            )
+        if hasattr(self.control_panel, "update"):
+            self.control_panel.update()
 
     @staticmethod
     def _check_ffmpeg():
@@ -1290,7 +1382,8 @@ class RealtimeCascadeDetector:
 
     def _detect_with_pose(self, frame):
         frame_height, frame_width = frame.shape[:2]
-        results = self.pose_model(frame, conf=0.25, imgsz=self.pose_imgsz, verbose=False)
+        pose_model = self._get_pose_model()
+        results = pose_model(frame, conf=0.25, imgsz=self.pose_imgsz, verbose=False)
         if not results:
             return []
 
@@ -1784,6 +1877,8 @@ class RealtimeCascadeDetector:
         """处理单个视频，返回是否正常完成"""
         import time
 
+        self._prepare_detector_for_run()
+
         reader = VideoReader(video_source, use_gpu=True)
         if not reader.start():
             print(f"无法打开视频源: {video_source}")
@@ -1827,10 +1922,11 @@ class RealtimeCascadeDetector:
         target_size = self.control_panel.get_target_size_mb()
 
         source_has_audio = self.has_ffmpeg and self._source_has_audio(video_source)
+        use_direct_mux = platform.system() == "Darwin" and source_has_audio
 
         # 构建 ffmpeg 命令
         temp_output = output_path.replace(".mp4", "_noaudio.mp4")
-        output_target = output_path if source_has_audio else temp_output
+        output_target = output_path if use_direct_mux else temp_output
         ffmpeg_cmd = [
             "ffmpeg",
             "-y",
@@ -1848,7 +1944,7 @@ class RealtimeCascadeDetector:
             "-",
         ]
 
-        if source_has_audio:
+        if use_direct_mux:
             ffmpeg_cmd.extend(["-i", str(video_source)])
 
         if target_size > 0 and duration > 0:
@@ -1874,7 +1970,7 @@ class RealtimeCascadeDetector:
             # 无目标大小：CRF 模式
             ffmpeg_cmd.extend(["-c:v", "libx264", "-preset", "medium", "-crf", "23"])
 
-        if source_has_audio:
+        if use_direct_mux:
             ffmpeg_cmd.extend([
                 "-map",
                 "0:v:0",
@@ -1908,13 +2004,18 @@ class RealtimeCascadeDetector:
 
         ffmpeg_failed = False
         ffmpeg_error = ""
+        stopped = False
 
         while True:
             if self.control_panel.is_stopped():
                 print("用户停止处理")
+                stopped = True
                 break
             ret, frame = reader.read()
             if not ret:
+                if self.control_panel.is_stopped():
+                    print("用户停止处理")
+                    stopped = True
                 break
 
             if (
@@ -1983,6 +2084,30 @@ class RealtimeCascadeDetector:
             if not self.control_panel.update():
                 break
 
+        # 用户主动停止时，直接强制终止，避免卡在读帧或 ffmpeg 收尾
+        if stopped:
+            reader.force_stop()
+            if ffmpeg_proc.stdin and not ffmpeg_proc.stdin.closed:
+                ffmpeg_proc.stdin.close()
+            ffmpeg_proc.terminate()
+            try:
+                ffmpeg_proc.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                ffmpeg_proc.kill()
+                ffmpeg_proc.wait(timeout=1.0)
+            if preview:
+                cv2.destroyAllWindows()
+            if ffmpeg_proc.stderr:
+                ffmpeg_proc.stderr.close()
+            if os.path.exists(temp_output):
+                os.remove(temp_output)
+            if os.path.exists(output_path):
+                os.remove(output_path)
+            self.control_panel.status_label.configure(
+                text="处理已停止，文件已删除", foreground="orange"
+            )
+            return False
+
         # 最终统计
         reader.stop()
         if ffmpeg_proc.stdin and not ffmpeg_proc.stdin.closed:
@@ -2019,24 +2144,11 @@ class RealtimeCascadeDetector:
             print(f"输出失败：未生成输出视频 {expected_output}")
             return False
 
-        stopped = self.control_panel.is_stopped()
-
-        if stopped:
+        # macOS 直接复用单段写入；Windows 保持两段法更稳定
+        if use_direct_mux:
             if os.path.exists(temp_output):
                 os.remove(temp_output)
-            output_censored = output_path
-            if os.path.exists(output_censored):
-                os.remove(output_censored)
-            self.control_panel.status_label.configure(
-                text="处理已停止，文件已删除", foreground="orange"
-            )
-            return False
-
-        # 已直接写入带音频输出，无需二次合并
-        if source_has_audio:
-            if os.path.exists(temp_output):
-                os.remove(temp_output)
-        elif self.has_ffmpeg and video_source != 0:
+        elif source_has_audio and self.has_ffmpeg and video_source != 0:
             merged = self._merge_audio(video_source, temp_output, output_path)
             if os.path.exists(temp_output):
                 os.remove(temp_output)
